@@ -12,6 +12,10 @@ use std::{collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use tokio::time::Instant;
 
 use crate::constraints::error::ConstraintsApiError;
+
+// This is the maximum length (randomly chosen) of a request body in bytes.
+pub(crate) const MAX_REQUEST_LENGTH: usize = 1024 * 1024 * 5;
+
 #[derive(Clone)]
 pub struct ConstraintsApi <A, DB>
 where 
@@ -125,8 +129,7 @@ where
 
         // Read the body
         let body = req.into_body();
-        // TODO: Make sure length limit
-        let body_bytes = to_bytes(body, 1024 * 1024).await?;
+        let body_bytes = to_bytes(body, MAX_REQUEST_LENGTH).await?;
         
         // Decode the incoming request body into a `SignedDelegation`.
         let mut signed_delegation: SignedDelegation = match serde_json::from_slice(&body_bytes) {
@@ -194,8 +197,7 @@ where
 
         // Read the body
         let body = req.into_body();
-        // TODO: Make sure length limit
-        let body_bytes = to_bytes(body, 1024 * 1024).await?;
+        let body_bytes = to_bytes(body, MAX_REQUEST_LENGTH).await?;
         
         // Decode the incoming request body into a `SignedDelegation`.
         let mut signed_revocation: SignedRevocation = match serde_json::from_slice(&body_bytes) {
@@ -290,8 +292,7 @@ pub async fn decode_constraints_submission(
 
     // Read the body
     let body = req.into_body();
-    // TODO: Make sure length limit
-    let body_bytes = to_bytes(body, 1024 * 1024).await?;
+    let body_bytes = to_bytes(body, MAX_REQUEST_LENGTH).await?;
     
     // Decode the body
     let constraints: List<SignedConstraints, MAX_CONSTRAINTS_PER_SLOT> = if is_ssz {
