@@ -12,31 +12,10 @@ use uuid::Uuid;
 use std::{collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use tokio::time::Instant;
 
-#[derive(Debug, thiserror::Error)]
-pub enum ConstraintsApiError {
-    #[error("hyper error: {0}")]
-    HyperError(#[from] hyper::Error),
-    #[error("axum error: {0}")]
-    AxumError(#[from] axum::Error),
-    #[error("serde decode error: {0}")]
-    SerdeDecodeError(#[from] serde_json::Error),
-    #[error("Invalid constraints")]
-    InvalidConstraints,
-    #[error("Invalid delegation ")]
-    InvalidDelegation,
-    #[error("Invalid revocation")]
-    InvalidRevocation,
-    #[error("Invalid signature")]
-    InvalidSignature,
-    #[error("Constraints field is empty")]
-    NilConstraints,
-    #[error("datastore error: {0}")]
-    AuctioneerError(#[from] AuctioneerError),
-    #[error("internal error")]
-    InternalError,
-    #[error("failed to get constraints proof data")]
-    ConstraintsProofDataError(#[from] ProofError),
-}
+use crate::constraints::error::ConstraintsApiError;
+
+// This is the maximum length (randomly chosen) of a request body in bytes.
+pub(crate) const MAX_REQUEST_LENGTH: usize = 1024 * 1024 * 5;
 
 #[derive(Clone)]
 pub struct ConstraintsApi <A, DB>
@@ -128,7 +107,14 @@ where
             // api.constraints_handle.send_constraints(message);
 
             // Finally add the constraints to the redis cache
-            api.save_constraints_to_auctioneer(&mut trace, message.slot, signed_constraints, &request_id);
+            if let Err(err) = api.save_constraints_to_auctioneer(
+                &mut trace,
+                message.slot,
+                signed_constraints,
+                &request_id
+            ).await {
+                error!(request_id = %request_id, error = %err, "Failed to save constraints to auctioneer");
+            };
         }
 
         // Log some final info
@@ -164,8 +150,7 @@ where
 
         // Read the body
         let body = req.into_body();
-        // TODO: Make sure length limit
-        let body_bytes = to_bytes(body, 1024 * 1024).await?;
+        let body_bytes = to_bytes(body, MAX_REQUEST_LENGTH).await?;
         
         // Decode the incoming request body into a `SignedDelegation`.
         let mut signed_delegation: SignedDelegation = match serde_json::from_slice(&body_bytes) {
@@ -233,8 +218,7 @@ where
 
         // Read the body
         let body = req.into_body();
-        // TODO: Make sure length limit
-        let body_bytes = to_bytes(body, 1024 * 1024).await?;
+        let body_bytes = to_bytes(body, MAX_REQUEST_LENGTH).await?;
         
         // Decode the incoming request body into a `SignedDelegation`.
         let mut signed_revocation: SignedRevocation = match serde_json::from_slice(&body_bytes) {
@@ -329,8 +313,7 @@ pub async fn decode_constraints_submission(
 
     // Read the body
     let body = req.into_body();
-    // TODO: Make sure length limit
-    let body_bytes = to_bytes(body, 1024 * 1024).await?;
+    let body_bytes = to_bytes(body, MAX_REQUEST_LENGTH).await?;
     
     // Decode the body
     let constraints: List<SignedConstraints, MAX_CONSTRAINTS_PER_SLOT> = if is_ssz {
