@@ -34,7 +34,7 @@ use helix_common::{
         BidSubmission, BidTrace, SignedBidSubmission,
     }, chain_info::ChainInfo, proofs::{self, verify_multiproofs, ConstraintsWithProofData, InclusionProofs, SignedConstraints, SignedConstraintsWithProofData}, signing::RelaySigningContext, simulator::BlockSimError, versioned_payload::PayloadAndBlobs, BuilderInfo, GossipedHeaderTrace, GossipedPayloadTrace, HeaderSubmissionTrace, SignedBuilderBid, SubmissionTrace
 };
-use helix_database::DatabaseService;
+use helix_database::{error::DatabaseError, DatabaseService};
 use helix_datastore::{types::SaveBidAndUpdateTopBidResponse, Auctioneer};
 use helix_housekeeper::{ChainUpdate, PayloadAttributesUpdate, SlotUpdate};
 use helix_utils::{get_payload_attributes_key, has_reached_fork, try_decode_into};
@@ -157,6 +157,8 @@ where
         }
     }
 
+    /// This endpoint returns a list of signed constraints for a given `slot`.
+    /// 
     /// Implements this API: <https://chainbound.github.io/bolt-docs/api/relay#constraints>
     pub async fn constraints(
         Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
@@ -168,7 +170,6 @@ where
         if slot > head_slot || slot < head_slot - 32 {
             return Err(BuilderApiError::IncorrectSlot(slot));
         }
-
         
         match api.auctioneer.get_constraints(slot).await {
             Ok(Some(cache)) => {
@@ -180,7 +181,7 @@ where
                 Ok(Json(constraints))
             }
             Ok(None) => {
-                Ok(Json(vec![])) // Return an empty vector if no constraints are found
+                Ok(Json(vec![])) // Return an empty vector if no delegations found
             }
             Err(err) => {
                 warn!(error=%err, "Failed to get constraints");
@@ -189,6 +190,8 @@ where
         }
     }
 
+    /// This endpoint returns a stream of signed constraints for a given `slot`.
+    /// 
     /// Implements this API: <https://chainbound.github.io/bolt-docs/api/relay#constraints-stream>
     pub async fn constraints_stream(
         Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
@@ -214,6 +217,43 @@ where
         });
 
         Sse::new(filtered).keep_alive(KeepAlive::default())
+    }
+
+    /// This endpoint returns the active delegations for the validator scheduled to propose 
+    /// at the provided `slot`. The delegations are returned as a list of BLS pubkeys.
+    /// 
+    /// Implements this API: <https://chainbound.github.io/bolt-docs/api/relay#delegations>
+    pub async fn delegations(
+        Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
+        Query(slot): Query<SlotQuery>,
+    ) -> Result<impl IntoResponse, BuilderApiError> {
+        let slot = slot.slot;
+        let duty_bytes = api.proposer_duties_response.read().await.clone();
+        let proposer_duties: Vec<BuilderGetValidatorsResponse> = serde_json::from_slice(&duty_bytes.unwrap()).unwrap();
+
+        let duty = proposer_duties
+            .iter()
+            .find(|duty| duty.slot == slot)
+            .ok_or(BuilderApiError::ProposerDutyNotFound)?;
+
+        let pubkey = duty.entry.message.public_key.clone();
+
+        match api.db.get_validator_delegations(pubkey).await {
+            Ok(delegations) => Ok(Json(delegations)),
+
+            Err(err) => {
+                match err {
+                    DatabaseError::ValidatorDelegationNotFound => {
+                        warn!("No delegations found for validator");
+                        Ok(Json(vec![])) // Return an empty vector if no delegations found
+                    }
+                    _ => {
+                        warn!(error=%err, "Failed to get delegations");
+                        Err(BuilderApiError::DatabaseError(err))
+                    }
+                }
+            }
+        }
     }
 
     /// Handles the submission of a new block by performing various checks and verifications
@@ -440,10 +480,10 @@ where
     /// 1. Receives the request and decodes the payload into a `SignedBidSubmission` object.
     /// 2. Validates the builder and checks against the next proposer duty.
     /// 3. Verifies the signature of the payload.
-    /// 4. Fetches and handles inclusion proofs.
+    /// 4. Fetches the constraints for the slot and verifies the inclusion proofs.
     /// 5. Runs further validations against the auctioneer.
     /// 6. Simulates the block to validate the payment.
-    /// 7. Saves the bid and proofs to the auctioneer and db.
+    /// 7. Saves the bid and inclusion proof to the auctioneer.
     ///
     /// Implements this API: <https://chainbound.github.io/bolt-docs/api/relay#blocks_with_proofs>
     pub async fn submit_block_with_proofs(
@@ -637,7 +677,7 @@ where
             None => { /* Bid wasn't saved so no need to gossip as it will never be served */ }
         }
 
-        // Save inclusion proofs to auctioneer.
+        // Save inclusion proof to auctioneer.
         if let Err(err) = api.save_inclusion_proof(
             payload.slot(),
             payload.proposer_public_key(),

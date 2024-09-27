@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -25,6 +25,7 @@ use crate::{
 pub struct MockDatabaseService {
     known_validators: Arc<Mutex<Vec<ValidatorSummary>>>,
     proposer_duties: Arc<Mutex<Vec<BuilderGetValidatorsResponseEntry>>>,
+    validator_delegations: Arc<Mutex<HashMap<BlsPublicKey, Vec<BlsPublicKey>>>>,
 }
 
 impl MockDatabaseService {
@@ -32,17 +33,38 @@ impl MockDatabaseService {
         known_validators: Arc<Mutex<Vec<ValidatorSummary>>>,
         proposer_duties: Arc<Mutex<Vec<BuilderGetValidatorsResponseEntry>>>,
     ) -> Self {
-        Self { known_validators, proposer_duties }
+        Self {
+            known_validators,
+            proposer_duties,
+            validator_delegations: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
 #[async_trait]
 impl DatabaseService for MockDatabaseService {
+    async fn get_validator_delegations(
+        &self,
+        pub_key: BlsPublicKey,
+    ) -> Result<Vec<BlsPublicKey>, DatabaseError> {
+        let validator_delegations = self.validator_delegations.lock().unwrap();
+        let delegations = validator_delegations.get(&pub_key);
+        match delegations {
+            Some(delegations) => Ok(delegations.clone()),
+            None => Ok(vec![]),
+        }
+    }
+
     async fn save_validator_delegation(
         &self,
         signed_delegation: SignedDelegation,
     ) -> Result<(), DatabaseError> {
-        println!("received delegation: {:?}", signed_delegation);
+        // Add to the hashmap mapping
+        let mut validator_delegations = self.validator_delegations.lock().unwrap();
+        let delegatee_pub_key = signed_delegation.message.delegatee_pubkey;
+        let validator_pub_key = signed_delegation.message.validator_pubkey;
+        let delegations = validator_delegations.entry(validator_pub_key).or_insert_with(Vec::new);
+        delegations.push(delegatee_pub_key);
         Ok(())
     }
     async fn revoke_validator_delegation(
