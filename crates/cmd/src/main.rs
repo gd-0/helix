@@ -1,6 +1,7 @@
 use helix_api::service::ApiService;
 use helix_common::{LoggingConfig, RelayConfig};
 use tokio::runtime::Builder;
+use tracing::trace;
 
 async fn run() {
     let config = match RelayConfig::load() {

@@ -10,7 +10,7 @@ use tokio::{
     sync::{broadcast, Mutex},
     time::{sleep, Instant},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use helix_beacon_client::{
     error::BeaconClientError,
