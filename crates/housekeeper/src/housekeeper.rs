@@ -428,7 +428,7 @@ impl<DB: DatabaseService, BeaconClient: MultiBeaconClientTrait, A: Auctioneer>
     pub async fn format_and_store_duties(
         &self,
         proposer_duties: Vec<ProposerDuty>,
-        mut signed_validator_registrations: HashMap<BlsPublicKey, SignedValidatorRegistrationEntry>,
+        signed_validator_registrations: HashMap<BlsPublicKey, SignedValidatorRegistrationEntry>,
     ) -> Result<usize, DatabaseError> {
         let mut formatted_proposer_duties: Vec<BuilderGetValidatorsResponseEntry> =
             Vec::with_capacity(proposer_duties.len());
@@ -436,7 +436,7 @@ impl<DB: DatabaseService, BeaconClient: MultiBeaconClientTrait, A: Auctioneer>
         let len = proposer_duties.len();
 
         for duty in proposer_duties {
-            if let Some(reg) = signed_validator_registrations.remove(&duty.public_key) {
+            if let Some(reg) = signed_validator_registrations.get(&duty.public_key).cloned() {
                 formatted_proposer_duties.push(BuilderGetValidatorsResponseEntry {
                     slot: duty.slot,
                     validator_index: duty.validator_index,
