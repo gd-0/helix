@@ -433,6 +433,8 @@ impl<DB: DatabaseService, BeaconClient: MultiBeaconClientTrait, A: Auctioneer>
         let mut formatted_proposer_duties: Vec<BuilderGetValidatorsResponseEntry> =
             Vec::with_capacity(proposer_duties.len());
 
+        let len = proposer_duties.len();
+
         for duty in proposer_duties {
             if let Some(reg) = signed_validator_registrations.remove(&duty.public_key) {
                 formatted_proposer_duties.push(BuilderGetValidatorsResponseEntry {
@@ -440,6 +442,13 @@ impl<DB: DatabaseService, BeaconClient: MultiBeaconClientTrait, A: Auctioneer>
                     validator_index: duty.validator_index,
                     entry: reg.registration_info,
                 });
+            } else {
+                warn!(
+                    public_key = %duty.public_key,
+                    slot = duty.slot,
+                    proposer_duties_len = len,
+                    "No signed validator registration found for proposer duty"
+                );
             }
         }
 
