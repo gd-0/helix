@@ -1,30 +1,26 @@
 use std::{
-    collections::HashMap, io::Read, ops::Deref, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}
+    collections::HashMap, io::Read, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 
 use axum::{
-    extract::ws::{WebSocket, WebSocketUpgrade, Message},
-    body::{to_bytes, Body},
-    http::{Request, StatusCode},
-    response::{IntoResponse, Response},
-    Extension,
+    body::{to_bytes, Body}, extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Query}, http::{Request, StatusCode}, response::{sse::{Event, KeepAlive}, IntoResponse, Response, Sse}, Extension, Json
 };
 use ethereum_consensus::{
     configs::mainnet::{CAPELLA_FORK_EPOCH, SECONDS_PER_SLOT},
     phase0::mainnet::SLOTS_PER_EPOCH,
-    primitives::{BlsPublicKey, Bytes32, Hash32},
+    primitives::{BlsPublicKey, Hash32},
     ssz::{self, prelude::*},
 };
 use flate2::read::GzDecoder;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use hyper::HeaderMap;
 use tokio::{
     sync::{
-        mpsc::{self, error::SendError, Receiver, Sender},
-        RwLock,
+        broadcast, mpsc::{self, error::SendError, Receiver, Sender}, RwLock
     },
     time::{self, Instant},
 };
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -33,24 +29,30 @@ use helix_common::{
         builder_api::{BuilderGetValidatorsResponse, BuilderGetValidatorsResponseEntry}, proposer_api::ValidatorRegistrationInfo
     }, bid_submission::{
         v2::header_submission::{
-            SignedHeaderSubmission, SignedHeaderSubmissionCapella, SignedHeaderSubmissionDeneb,
+            SignedHeaderSubmission, SignedHeaderSubmissionDeneb,
         },
         BidSubmission, BidTrace, SignedBidSubmission,
-    }, chain_info::ChainInfo, proofs::{self, verify_multiproofs, ConstraintsWithProofData, InclusionProofs}, signing::RelaySigningContext, simulator::BlockSimError, versioned_payload::PayloadAndBlobs, BuilderInfo, GossipedHeaderTrace, GossipedPayloadTrace, HeaderSubmissionTrace, SignedBuilderBid, SubmissionTrace
+    }, chain_info::ChainInfo, proofs::{self, verify_multiproofs, ConstraintsWithProofData, InclusionProofs, SignedConstraints, SignedConstraintsWithProofData}, signing::RelaySigningContext, simulator::BlockSimError, versioned_payload::PayloadAndBlobs, BuilderInfo, GossipedHeaderTrace, GossipedPayloadTrace, HeaderSubmissionTrace, SignedBuilderBid, SubmissionTrace
 };
-use helix_database::DatabaseService;
-use helix_datastore::{types::SaveBidAndUpdateTopBidResponse, Auctioneer};
+use helix_database::{error::DatabaseError, DatabaseService};
+use helix_datastore::{error::AuctioneerError, types::SaveBidAndUpdateTopBidResponse, Auctioneer};
 use helix_housekeeper::{ChainUpdate, PayloadAttributesUpdate, SlotUpdate};
-use helix_utils::{calculate_withdrawals_root, get_payload_attributes_key, has_reached_fork, try_decode_into};
+use helix_utils::{get_payload_attributes_key, has_reached_fork, try_decode_into};
+use serde::{de, Deserialize};
 
 use crate::{builder::{
     error::{self, BuilderApiError}, traits::BlockSimulator, BlockSimRequest, DbInfo, OptimisticVersion,
-}, gossiper::{
+}, constraints::api::ConstraintsHandle, gossiper::{
     traits::GossipClientTrait,
     types::{BroadcastHeaderParams, BroadcastPayloadParams, GossipedMessage},
 }};
 
 pub(crate) const MAX_PAYLOAD_LENGTH: usize = 1024 * 1024 * 10;
+
+#[derive(Deserialize)]
+pub struct SlotQuery {
+    slot: u64
+}
 
 #[derive(Clone)]
 pub struct BuilderApi<A, DB, S, G>
@@ -68,6 +70,7 @@ where
     signing_context: Arc<RelaySigningContext>,
 
     db_sender: Sender<DbInfo>,
+    constraints_tx: broadcast::Sender<SignedConstraints>,
 
     /// Information about the current head slot and next proposer duty
     curr_slot_info: Arc<RwLock<(u64, Option<BuilderGetValidatorsResponseEntry>)>>,
@@ -92,8 +95,9 @@ where
         signing_context: Arc<RelaySigningContext>,
         slot_update_subscription: Sender<Sender<ChainUpdate>>,
         gossip_receiver: Receiver<GossipedMessage>,
-    ) -> Self {
+    ) -> (Self, ConstraintsHandle) {
         let (db_sender, db_receiver) = mpsc::channel::<DbInfo>(10_000);
+        let (constraints_tx, _ ) = broadcast::channel(128);
 
         // Spin up db processing task
         let db_clone = db.clone();
@@ -110,6 +114,7 @@ where
             signing_context,
 
             db_sender,
+            constraints_tx: constraints_tx.clone(),
 
             curr_slot_info: Arc::new(RwLock::new((0, None))),
             proposer_duties_response: Arc::new(RwLock::new(None)),
@@ -134,7 +139,7 @@ where
             }
         });
 
-        api
+        (api, ConstraintsHandle {constraints_tx} )
     }
 
     /// Implements this API: <https://flashbots.github.io/relay-specs/#/Builder/getValidators>
@@ -149,6 +154,102 @@ where
                 .unwrap()
                 .into_response(),
             None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
+    /// This endpoint returns a list of signed constraints for a given `slot`.
+    /// 
+    /// Implements this API: <https://docs.boltprotocol.xyz/api/relay#constraints>
+    pub async fn constraints(
+        Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
+        Query(slot): Query<SlotQuery>,
+    ) -> Result<impl IntoResponse, BuilderApiError> {
+        let slot = slot.slot;
+        let head_slot = api.curr_slot_info.read().await.0;
+        
+        if slot < head_slot || slot > head_slot + 32 {
+            return Err(BuilderApiError::IncorrectSlot(slot));
+        }
+        
+        match api.auctioneer.get_constraints(slot).await {
+            Ok(Some(cache)) => {
+                let constraints = cache
+                    .into_iter()
+                    .map(|data| data.signed_constraints)
+                    .collect::<Vec<SignedConstraints>>();
+        
+                Ok(Json(constraints))
+            }
+            Ok(None) => {
+                debug!("No constraints found for slot");
+                Ok(Json(vec![])) // Return an empty vector if no delegations found
+            }
+            Err(err) => {
+                warn!(error=%err, "Failed to get constraints");
+                Err(BuilderApiError::AuctioneerError(err))
+            }
+        }
+    }
+
+    /// This endpoint returns a stream of signed constraints for a given `slot`.
+    /// 
+    /// Implements this API: <https://docs.boltprotocol.xyz/api/relay#constraints-stream>
+    pub async fn constraints_stream(
+        Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
+    ) -> Sse<impl Stream<Item = Result<Event, BuilderApiError>>> {
+        let constraints_rx = api.constraints_tx.subscribe();
+        let stream = BroadcastStream::new(constraints_rx);
+
+        let filtered = stream.map(|result| match result {
+            Ok(constraint) => match serde_json::to_string(&constraint) {
+                Ok(json) => Ok(Event::default()
+                    .data(json)
+                    .event("signed_constraint")
+                    .retry(Duration::from_millis(50))),
+                Err(err) => {
+                    warn!(error = %err, "Failed to serialize constraint");
+                    Err(BuilderApiError::SszSerializeError)
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "Error receiving constraint message");
+                Err(BuilderApiError::InternalError)
+            }
+        });
+
+        Sse::new(filtered).keep_alive(KeepAlive::default())
+    }
+
+    /// This endpoint returns the active delegations for the validator scheduled to propose 
+    /// at the provided `slot`. The delegations are returned as a list of BLS pubkeys.
+    /// 
+    /// Implements this API: <https://docs.boltprotocol.xyz/api/relay#delegations>
+    pub async fn delegations(
+        Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
+        Query(slot): Query<SlotQuery>,
+    ) -> Result<impl IntoResponse, BuilderApiError> {
+        let slot = slot.slot;
+        let Some(duty_bytes) = &*api.proposer_duties_response.read().await else {
+            return Err(BuilderApiError::ProposerDutyNotFound);
+        };
+        let Ok(proposer_duties) = serde_json::from_slice::<Vec<BuilderGetValidatorsResponse>>(duty_bytes) else {
+            return Err(BuilderApiError::DeserializeError);
+        };
+
+        let duty = proposer_duties
+            .iter()
+            .find(|duty| duty.slot == slot)
+            .ok_or(BuilderApiError::ProposerDutyNotFound)?;
+
+        let pubkey = duty.entry.message.public_key.clone();
+
+        match api.auctioneer.get_validator_delegations(pubkey).await {
+            Ok(delegations) => Ok(Json(delegations)),
+
+            Err(err) => {
+                warn!(error=%err, "Failed to get delegations");
+                Err(BuilderApiError::AuctioneerError(err))
+            }
         }
     }
 
@@ -376,12 +477,12 @@ where
     /// 1. Receives the request and decodes the payload into a `SignedBidSubmission` object.
     /// 2. Validates the builder and checks against the next proposer duty.
     /// 3. Verifies the signature of the payload.
-    /// 4. Fetches and handles inclusion proofs.
+    /// 4. Fetches the constraints for the slot and verifies the inclusion proofs.
     /// 5. Runs further validations against the auctioneer.
     /// 6. Simulates the block to validate the payment.
-    /// 7. Saves the bid and proofs to the auctioneer and db.
+    /// 7. Saves the bid and inclusion proof to the auctioneer.
     ///
-    /// Implements this API: <https://chainbound.github.io/bolt-docs/api/relay#blocks_with_proofs>
+    /// Implements this API: <https://docs.boltprotocol.xyz/api/relay#blocks_with_proofs>
     pub async fn submit_block_with_proofs(
         Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
         req: Request<Body>,
@@ -447,6 +548,10 @@ where
         {
             match err {
                 BuilderApiError::DuplicateBlockHash { block_hash } => {
+                    // We dont return the error here as we want to continue processing the request.
+                    // This mitigates the risk of someone sending an invalid payload
+                    // with a valid header, which would block subsequent submissions with the same
+                    // header and valid payload.
                     debug!(
                         request_id = %request_id,
                         block_hash = ?block_hash,
@@ -542,7 +647,7 @@ where
             }
         }
 
-        // Save bid and proofs to auctioneer
+        // Save bid to auctioneer
         match api
             .save_bid_to_auctioneer(
                 &payload,
@@ -553,6 +658,8 @@ where
             )
             .await?
         {
+            // If the bid was succesfully saved then we gossip the header and payload to all other
+            // relays.
             Some((builder_bid, execution_payload)) => {
                 api.gossip_new_submission(
                     &payload,
@@ -564,10 +671,10 @@ where
                 )
                 .await;
             }
-            None => { /* Bid wasn't saved, so no need to gossip as it will never be served */ }
+            None => { /* Bid wasn't saved so no need to gossip as it will never be served */ }
         }
 
-        // Save inclusion proofs to auctioneer.
+        // Save inclusion proof to auctioneer.
         if let Err(err) = api.save_inclusion_proof(
             payload.slot(),
             payload.proposer_public_key(),
@@ -1365,15 +1472,19 @@ where
     async fn verify_inclusion_proof(
         &self,
         payload: &SignedBidSubmission,
-        constraints: &[ConstraintsWithProofData],
+        constraints: &[SignedConstraintsWithProofData],
     ) -> Result<(), BuilderApiError> {
-        // TODO: Clean this if possible
         let mut tx_clone = payload.transactions().clone();
         let root = tx_clone.hash_tree_root().expect("failed to hash tree root");
         let root = root.to_vec().as_slice().try_into().expect("failed to convert to hash32");
     
         let proofs = payload.proofs().expect("proofs not found");
-        match verify_multiproofs(constraints, proofs, root) {
+        let constraints: Vec<_> = constraints.iter().map(|c| ConstraintsWithProofData {
+            message: c.signed_constraints.message.clone(),
+            proof_data: c.proof_data.clone(),
+        }).collect();
+    
+        match verify_multiproofs(&constraints, proofs, root) {
             Ok(_) => Ok(()),
             Err(_) => Err(BuilderApiError::InclusionProofVerificationFailed),
         }

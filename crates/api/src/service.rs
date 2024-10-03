@@ -154,7 +154,7 @@ impl ApiService {
         let (builder_gossip_sender, builder_gossip_receiver) = tokio::sync::mpsc::channel(10_000);
         let (proposer_gossip_sender, proposer_gossip_receiver) = tokio::sync::mpsc::channel(10_000);
 
-        let builder_api = Arc::new(BuilderApiProd::new(
+        let (builder_api, constraints_handle) = BuilderApiProd::new(
             auctioneer.clone(),
             db.clone(),
             chain_info.clone(),
@@ -163,7 +163,8 @@ impl ApiService {
             relay_signing_context,
             slot_update_sender.clone(),
             builder_gossip_receiver,
-        ));
+        );
+        let builder_api = Arc::new(builder_api);
 
         gossiper.start_server(builder_gossip_sender, proposer_gossip_sender).await;
 
@@ -176,7 +177,7 @@ impl ApiService {
             broadcasters,
             multi_beacon_client.clone(),
             chain_info.clone(),
-            slot_update_sender,
+            slot_update_sender.clone(),
             validator_preferences.clone(),
             config.target_get_payload_propagation_duration_ms,
             proposer_gossip_receiver,
@@ -187,7 +188,8 @@ impl ApiService {
         let constraints_api = Arc::new(ConstraintsApiProd::new(
             auctioneer.clone(),
             db.clone(),
-            chain_info.clone()
+            chain_info.clone(),
+            constraints_handle
         ));
 
         let bids_cache: Arc<BidsCache> = Arc::new(

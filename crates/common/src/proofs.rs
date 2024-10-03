@@ -4,11 +4,12 @@ use ethereum_consensus::{
 };
 use reth_primitives::{TxHash, keccak256, B256};
 use tree_hash::Hash256;
+use sha2::{Digest, Sha256};
 
 // Import the new version of the `ssz-rs` crate for multiproof verification.
 use ::ssz_rs as ssz;
 
-use crate::api::constraints_api::MAX_CONSTRAINTS_PER_SLOT;
+use crate::api::constraints_api::{SignableBLS, MAX_CONSTRAINTS_PER_SLOT};
 use crate::eth::SignedBuilderBid;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,20 +46,32 @@ pub struct BidWithProofs {
 
 pub type HashTreeRoot = tree_hash::Hash256;
 
-// NOTE: This type is redefined here to avoid circular dependencies.
 #[derive(Debug, Clone, Serializable, serde::Deserialize, serde::Serialize)]
 pub struct SignedConstraints {
     pub message: ConstraintsMessage,
     pub signature: BlsSignature,
 }
 
-// NOTE: This type is redefined here to avoid circular dependencies.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Serializable, Merkleized)]
 pub struct ConstraintsMessage {
     pub pubkey: BlsPublicKey,
     pub slot: u64,
     pub top: bool,
     pub transactions: List<Transaction, MAX_CONSTRAINTS_PER_SLOT>,
+}
+
+impl SignableBLS for ConstraintsMessage {
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(&self.pubkey.to_vec());
+        hasher.update(&self.slot.to_le_bytes());
+        hasher.update((self.top as u8).to_le_bytes());
+        for tx in self.transactions.iter() {
+            hasher.update(&keccak256(tx.to_vec()).as_slice());
+        }
+
+        hasher.finalize().into()
+    }
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -69,11 +82,18 @@ pub struct ConstraintsWithProofData {
     pub proof_data: Vec<(TxHash, HashTreeRoot)>,
 }
 
-impl TryFrom<ConstraintsMessage> for ConstraintsWithProofData {
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SignedConstraintsWithProofData {
+    pub signed_constraints: SignedConstraints,
+    pub proof_data: Vec<(TxHash, HashTreeRoot)>,
+}
+
+impl TryFrom<SignedConstraints> for SignedConstraintsWithProofData {
     type Error = ProofError;
 
-    fn try_from(value: ConstraintsMessage) -> Result<Self, ProofError> {
+    fn try_from(value: SignedConstraints) -> Result<Self, ProofError> {
         let transactions = value
+            .message
             .transactions
             .iter()
             .map(|tx| {
@@ -88,7 +108,7 @@ impl TryFrom<ConstraintsMessage> for ConstraintsWithProofData {
             })
             .collect::<Result<Vec<_>, ProofError>>()?;
 
-        Ok(Self { message: value, proof_data: transactions })
+        Ok(Self { signed_constraints: value, proof_data: transactions })
     }
 }
 

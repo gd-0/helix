@@ -2,16 +2,18 @@ use axum::{
     body::{to_bytes, Body}, extract::ws::{Message, WebSocket, WebSocketUpgrade}, http::{request, Request, StatusCode}, response::{IntoResponse, Response}, Extension
 };
 use ethereum_consensus::{primitives::{BlsPublicKey, BlsSignature}, deneb::{verify_signed_data, Slot}, ssz};
-use helix_common::{api::constraints_api::{SignedDelegation, SignedRevocation, MAX_CONSTRAINTS_PER_SLOT}, bellatrix::List, chain_info::ChainInfo, proofs::{ConstraintsWithProofData, ProofError, SignedConstraints}, ConstraintSubmissionTrace};
+use helix_common::{api::constraints_api::{SignableBLS, SignedDelegation, SignedRevocation, MAX_CONSTRAINTS_PER_SLOT}, bellatrix::List, chain_info::ChainInfo, proofs::{ConstraintsMessage, ConstraintsWithProofData, ProofError, SignedConstraints, SignedConstraintsWithProofData}, ConstraintSubmissionTrace};
 use helix_database::DatabaseService;
-use helix_datastore::{error::AuctioneerError, Auctioneer};
-use helix_utils::signing::verify_signed_builder_message as verify_signature;
+use helix_datastore::Auctioneer;
+use ethereum_consensus::signing::verify_signature;
 use tracing::{info, warn, error};
 use uuid::Uuid;
-use std::{collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
-use tokio::time::Instant;
+use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use tokio::{sync::broadcast, time::Instant};
 
 use crate::constraints::error::ConstraintsApiError;
+
+use super::error::Conflict;
 
 // This is the maximum length (randomly chosen) of a request body in bytes.
 pub(crate) const MAX_REQUEST_LENGTH: usize = 1024 * 1024 * 5;
@@ -25,6 +27,21 @@ where
     auctioneer: Arc<A>,
     db: Arc<DB>,
     chain_info: Arc<ChainInfo>,
+
+    constraints_handle: ConstraintsHandle,
+}
+
+#[derive(Clone)]
+pub struct ConstraintsHandle {
+    pub(crate) constraints_tx: broadcast::Sender<SignedConstraints>, 
+}
+
+impl ConstraintsHandle {
+    pub fn send_constraints(&self, constraints: SignedConstraints) {
+        if self.constraints_tx.send(constraints).is_err() {
+            error!("Failed to send constraints to the constraints channel");
+        }
+    }
 }
 
 impl<A, DB> ConstraintsApi <A, DB>
@@ -36,13 +53,14 @@ where
         auctioneer: Arc<A>,
         db: Arc<DB>,
         chain_info: Arc<ChainInfo>,
+        constraints_handle: ConstraintsHandle ,
     ) -> Self {
-        Self { auctioneer, db, chain_info }
+        Self { auctioneer, db, chain_info, constraints_handle }
     }
 
     /// Handles the submission of batch of signed constraints.
     /// 
-    /// Implements this API: <https://chainbound.github.io/bolt-docs/api/builder#constraints>
+    /// Implements this API: <https://docs.boltprotocol.xyz/api/builder#constraints>
     pub async fn submit_constraints(
         Extension(api): Extension<Arc<ConstraintsApi<A, DB>>>, 
         req: Request<Body>,
@@ -58,24 +76,33 @@ where
         );
 
         // Decode the incoming request body into a payload.
-        let constraints = decode_constraints_submission(req, &mut trace, &request_id).await?;
+        let signed_constraints = decode_constraints_submission(req, &mut trace, &request_id).await?;
 
-        if constraints.is_empty() {
+        if signed_constraints.is_empty() {
             return Err(ConstraintsApiError::NilConstraints);
         }
 
         // Add all the constraints to the cache
-        for mut signed_constraints in constraints {
-            // TODO: Clean this
-            let pubkey = signed_constraints.message.pubkey.clone();
-            let message = &mut signed_constraints.message;
+        for constraint in signed_constraints {
+            let pubkey = constraint.message.pubkey.clone();
+            let message = &constraint.message;
             
+            // Check for conflicts in the constraints
+            let saved_constraints = api.auctioneer.get_constraints(message.slot).await?;
+            if let Some(conflict) = conflicts_with(&saved_constraints, message) {
+                return Err(ConstraintsApiError::Conflict(conflict));
+            }
+
+            // Check if the maximum number of constraints per slot has been reached
+            if saved_constraints.is_some_and(|c| c.len() +1 > MAX_CONSTRAINTS_PER_SLOT) {
+                return Err(ConstraintsApiError::MaxConstraintsReached);
+            }
+
             // Verify the signature.
-            if let Err(_) = verify_signature(
-                message,
-                &signed_constraints.signature,
+            if let Err(err) = verify_signature(
                 &pubkey,
-                &api.chain_info.context
+                &message.digest(),
+                &constraint.signature,
             ) {
                 return Err(ConstraintsApiError::InvalidSignature);
             };
@@ -83,13 +110,14 @@ where
             // Once we support sending messages signed with correct validator pubkey on the sidecar, 
             // return error if invalid
 
-            let message = signed_constraints.message.clone();
+            // Send to the constraints channel
+            api.constraints_handle.send_constraints(constraint.clone());
 
             // Finally add the constraints to the redis cache
             if let Err(err) = api.save_constraints_to_auctioneer(
                 &mut trace,
-                message.slot,
-                signed_constraints,
+                constraint.message.slot,
+                constraint,
                 &request_id
             ).await {
                 error!(request_id = %request_id, error = %err, "Failed to save constraints to auctioneer");
@@ -110,7 +138,7 @@ where
 
     /// Handles delegating constraint submission rights to another BLS key.
     /// 
-    /// Implements this API: <https://chainbound.github.io/bolt-docs/api/builder#delegate>
+    /// Implements this API: <https://docs.boltprotocol.xyz/api/builder#delegate>
     pub async fn delegate(
         Extension(api): Extension<Arc<ConstraintsApi<A, DB>>>,
         req: Request<Body>,
@@ -138,16 +166,14 @@ where
         };
         trace.decode = get_nanos_timestamp()?;
 
-        // TODO: Clean this
         let pubkey = signed_delegation.message.validator_pubkey.clone();
         let message = &mut signed_delegation.message;
         
         // Verify the delegation signature
-        if let Err(e) = verify_signature(
-            message,
-            &signed_delegation.signature,
+        if let Err(_) = verify_signature(
             &pubkey,
-            &api.chain_info.context
+            &message.digest(),
+            &signed_delegation.signature,
         ) {
             return Err(ConstraintsApiError::InvalidSignature);
         };
@@ -155,7 +181,7 @@ where
 
         // Store the delegation in the database
         tokio::spawn( async move {
-            if let Err(err) = api.db.save_validator_delegation(signed_delegation).await {
+            if let Err(err) = api.auctioneer.save_validator_delegation(signed_delegation).await {
                 error!(
                     error = %err,
                     "Failed to save delegation",
@@ -178,7 +204,7 @@ where
 
     /// Handles revoking constraint submission rights from a BLS key.
     /// 
-    /// Implements this API: <https://chainbound.github.io/bolt-docs/api/builder#revoke>
+    /// Implements this API: <https://docs.boltprotocol.xyz/api/builder#revoke>
     pub async fn revoke(
         Extension(api): Extension<Arc<ConstraintsApi<A, DB>>>,
         req: Request<Body>,
@@ -208,12 +234,12 @@ where
 
         let pubkey = signed_revocation.message.validator_pubkey.clone();
         let message = &mut signed_revocation.message;
+        
         // Verify the revocation signature
         if let Err(e) = verify_signature(
-            message,
-            &signed_revocation.signature,
             &pubkey,
-            &api.chain_info.context
+            &message.digest(),
+            &signed_revocation.signature,
         ) {
             return Err(ConstraintsApiError::InvalidSignature);
         };
@@ -221,7 +247,7 @@ where
 
         // Store the delegation in the database
         tokio::spawn( async move {
-            if let Err(err) = api.db.revoke_validator_delegation(signed_revocation).await {
+            if let Err(err) = api.auctioneer.revoke_validator_delegation(signed_revocation).await {
                 error!(
                     error = %err,
                     "Failed to do revocation",
@@ -252,10 +278,10 @@ where
         &self,
         trace: &mut ConstraintSubmissionTrace,
         slot: Slot,
-        signed_constraints: SignedConstraints,
+        constraint: SignedConstraints,
         request_id: &Uuid,
     ) -> Result<(), ConstraintsApiError> {
-        let message_with_data = ConstraintsWithProofData::try_from(signed_constraints.message)?;
+        let message_with_data = SignedConstraintsWithProofData::try_from(constraint)?;
         match self.auctioneer
             .save_constraints(slot, message_with_data)
             .await
@@ -276,6 +302,36 @@ where
             }
         }
     }
+}
+
+/// Checks if the constraints for the given slot conflict with the existing constraints.
+/// Returns a [Conflict] in case of a conflict, None otherwise.
+///
+/// # Possible conflicts
+/// - Multiple ToB constraints per slot
+/// - Duplicates of the same transaction per slot
+pub fn conflicts_with(
+    saved_constraints: &Option<Vec<SignedConstraintsWithProofData>>, 
+    constraints: &ConstraintsMessage
+) -> Option<Conflict> {
+    // Check if there are saved constraints to compare against
+    if let Some(saved_constraints) = saved_constraints {
+        for saved_constraint in saved_constraints {
+            // Only 1 ToB (Top of Block) constraint per slot
+            if constraints.top && saved_constraint.signed_constraints.message.top {
+                return Some(Conflict::TopOfBlock);
+            }
+
+            // Check if any of the transactions are the same
+            for tx in constraints.transactions.iter() {
+                if saved_constraint.signed_constraints.message.transactions.iter().any(|existing| tx == existing) {
+                    return Some(Conflict::DuplicateTransaction);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 pub async fn decode_constraints_submission(

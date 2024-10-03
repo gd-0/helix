@@ -8,7 +8,7 @@ use ethereum_consensus::{
 };
 use futures_util::TryStreamExt;
 use helix_common::{
-    api::builder_api::TopBidUpdate, bid_submission::{v2::header_submission::SignedHeaderSubmission, BidSubmission}, pending_block::PendingBlock, proofs::{ConstraintsWithProofData, SignedConstraints}, versioned_payload::PayloadAndBlobs, ProposerInfo
+    api::{builder_api::TopBidUpdate, constraints_api::{SignedDelegation, SignedRevocation}}, bid_submission::{v2::header_submission::SignedHeaderSubmission, BidSubmission}, pending_block::PendingBlock, proofs::SignedConstraintsWithProofData, versioned_payload::PayloadAndBlobs, ProposerInfo
 };
 use redis::{AsyncCommands, RedisResult, Script, Value};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -48,9 +48,11 @@ use crate::{
     Auctioneer,
 };
 
-use super::utils::{get_constraints_key, get_hash_from_hex, get_pending_block_builder_block_hash_key, get_pending_block_builder_key, get_pubkey_from_hex};
+use super::utils::{get_constraints_key, get_delegations_key, get_hash_from_hex, get_pending_block_builder_block_hash_key, get_pending_block_builder_key, get_pubkey_from_hex};
 
-const CONSTRAINTS_CACHE_EXPIRY_S: usize = 12;
+// Constraints expire after 1 epoch = 32 slots.
+const CONSTRAINTS_CACHE_EXPIRY_S: usize = 12 * 32;
+
 const BID_CACHE_EXPIRY_S: usize = 45;
 const PENDING_BLOCK_EXPIRY_S: usize = 45;
 const HOUSEKEEPER_LOCK_EXPIRY_MS: usize = 45_000;
@@ -536,15 +538,83 @@ impl RedisCache {
 
 #[async_trait]
 impl Auctioneer for RedisCache {
+    async fn get_validator_delegations(
+        &self,
+        pub_key: BlsPublicKey,
+    ) -> Result<Vec<SignedDelegation>, AuctioneerError> {
+        let key = get_delegations_key(&pub_key);
+        
+        let delegations: Option<Vec<SignedDelegation>> = self
+            .get(&key)
+            .await
+            .map_err(AuctioneerError::RedisError)?;
+
+        Ok(delegations.unwrap_or_default())
+    }
+
+    async fn save_validator_delegation(
+        &self,
+        signed_delegation: SignedDelegation,
+    ) -> Result<(), AuctioneerError> {
+        let key = get_delegations_key(&signed_delegation.message.validator_pubkey);
+
+        // Attempt to get the existing delegations from the cache.
+        let delegations: Option<Vec<SignedDelegation>> = self
+            .get(&key)
+            .await
+            .map_err(AuctioneerError::RedisError)?;
+
+        // Append the new delegation to the existing delegations or create a new Vec if none exist.
+        let mut all_delegations = match delegations {
+            Some(mut delegations) => {
+                delegations.push(signed_delegation);
+                delegations
+            }
+            None => Vec::from([signed_delegation]),
+        };
+
+        // Save the updated delegations back to the cache.
+        self.set(&key, &all_delegations, None)
+            .await
+            .map_err(AuctioneerError::RedisError)
+    }
+
+    async fn revoke_validator_delegation(
+        &self,
+        signed_revocation: SignedRevocation,
+    ) -> Result<(), AuctioneerError> {
+        let key = get_delegations_key(&signed_revocation.message.validator_pubkey);
+        
+        // Attempt to get the existing delegations from the cache.
+        let delegations: Option<Vec<SignedDelegation>> = self
+            .get(&key)
+            .await
+            .map_err(AuctioneerError::RedisError)?;
+
+        // Filter out the revoked delegation.
+        let updated_delegations = match delegations {
+            Some(mut delegations) => {
+                delegations.retain(|delegation| delegation.message.delegatee_pubkey != signed_revocation.message.delegatee_pubkey);
+                delegations
+            }
+            None => Vec::new(),
+        };
+
+        // Save the updated delegations back to the cache.
+        self.set(&key, &updated_delegations, None)
+            .await
+            .map_err(AuctioneerError::RedisError)
+    }
+
     async fn save_constraints(
         &self,
         slot: u64,
-        constraints: ConstraintsWithProofData,
+        constraints: SignedConstraintsWithProofData,
     ) -> Result<(), AuctioneerError> {
         let key = get_constraints_key(slot);
     
         // Attempt to get the existing constraints from the cache.
-        let prev_constraints: Option<Vec<ConstraintsWithProofData>> = self
+        let prev_constraints: Option<Vec<SignedConstraintsWithProofData>> = self
             .get(&key)
             .await
             .map_err(AuctioneerError::RedisError)?;
@@ -567,7 +637,7 @@ impl Auctioneer for RedisCache {
     async fn get_constraints(
         &self,
         slot: u64,
-    ) -> Result<Option<Vec<ConstraintsWithProofData>>, AuctioneerError> {
+    ) -> Result<Option<Vec<SignedConstraintsWithProofData>>, AuctioneerError> {
         let key = get_constraints_key(slot);
         self.get(&key).await.map_err(AuctioneerError::RedisError)
     }
