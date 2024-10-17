@@ -201,7 +201,7 @@ where
         let stream = BroadcastStream::new(constraints_rx);
 
         let filtered = stream.map(|result| match result {
-            Ok(constraint) => match serde_json::to_string(&constraint) {
+            Ok(constraint) => match serde_json::to_string(&vec![constraint]) {
                 Ok(json) => Ok(Event::default()
                     .data(json)
                     .event("signed_constraint")
@@ -1486,7 +1486,10 @@ where
     
         match verify_multiproofs(&constraints, proofs, root) {
             Ok(_) => Ok(()),
-            Err(_) => Err(BuilderApiError::InclusionProofVerificationFailed),
+            Err(e) => {
+                error!(error = %e, "failed to verify inclusion proofs");
+                Err(BuilderApiError::InclusionProofVerificationFailed)
+            },
         }
     }
 
@@ -2261,7 +2264,7 @@ fn sanity_check_block_submission(
     payload_attributes: &PayloadAttributesUpdate,
     chain_info: &ChainInfo,
 ) -> Result<(), BuilderApiError> {
-    let expected_timestamp = chain_info.genesis_time_in_secs + (bid_trace.slot * SECONDS_PER_SLOT);
+    let expected_timestamp = chain_info.genesis_time_in_secs + (bid_trace.slot * chain_info.seconds_per_slot);
     if payload.timestamp() != expected_timestamp {
         return Err(BuilderApiError::IncorrectTimestamp {
             got: payload.timestamp(),

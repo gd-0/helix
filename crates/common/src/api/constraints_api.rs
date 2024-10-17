@@ -3,6 +3,12 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_CONSTRAINTS_PER_SLOT: usize = 256;
 
+/// The action type for a delegation message.
+pub const DELEGATION_ACTION: u8 = 0;
+
+/// The action type for a revocation message.
+pub const REVOCATION_ACTION: u8 = 1;
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct SignedDelegation {
     pub message: DelegationMessage,
@@ -11,6 +17,7 @@ pub struct SignedDelegation {
 
 #[derive(Debug, Clone, SimpleSerialize, serde::Deserialize, serde::Serialize)]
 pub struct DelegationMessage {
+    pub action: u8,
     pub validator_pubkey: BlsPublicKey,
     pub delegatee_pubkey: BlsPublicKey,
 }
@@ -18,6 +25,7 @@ pub struct DelegationMessage {
 impl SignableBLS for DelegationMessage {
     fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
+        hasher.update([self.action]);
         hasher.update(&self.validator_pubkey.to_vec());
         hasher.update(&self.delegatee_pubkey.to_vec());
         
@@ -34,6 +42,7 @@ pub struct SignedRevocation {
 
 #[derive(Debug, Clone, SimpleSerialize, serde::Deserialize, serde::Serialize)]
 pub struct RevocationMessage {
+    pub action: u8,
     pub validator_pubkey: BlsPublicKey,
     pub delegatee_pubkey: BlsPublicKey,
 }
@@ -41,6 +50,7 @@ pub struct RevocationMessage {
 impl SignableBLS for RevocationMessage {
     fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
+        hasher.update([self.action]);
         hasher.update(&self.validator_pubkey.to_vec());
         hasher.update(&self.delegatee_pubkey.to_vec());
         
