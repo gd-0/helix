@@ -158,6 +158,7 @@ impl RouterConfig {
                 Route::GetTopBid,
                 Route::GetBuilderConstraints,
                 Route::GetBuilderConstraintsStream,
+                Route::GetBuilderDelegations,
             ],
         );
 
