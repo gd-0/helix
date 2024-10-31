@@ -21,7 +21,7 @@ use helix_common::{
 use redis::{AsyncCommands, RedisResult, Script, Value};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::error;
+use tracing::{error, debug};
 
 use helix_common::{
     bid_submission::{BidTrace, SignedBidSubmission},
@@ -547,6 +547,9 @@ impl Auctioneer for RedisCache {
         &self,
         signed_delegations: Vec<SignedDelegation>,
     ) -> Result<(), AuctioneerError> {
+        let len = signed_delegations.len();
+        debug!(len, "saving delegations to cache");
+
         for signed_delegation in signed_delegations {
             let key = get_delegations_key(&signed_delegation.message.validator_pubkey);
     
@@ -555,7 +558,7 @@ impl Auctioneer for RedisCache {
                 self.get(&key).await.map_err(AuctioneerError::RedisError)?;
     
             // Append the new delegation to the existing delegations or create a new Vec if none exist.
-            let mut all_delegations = match delegations {
+            let all_delegations = match delegations {
                 Some(mut delegations) => {
                     delegations.push(signed_delegation);
                     delegations
@@ -566,6 +569,8 @@ impl Auctioneer for RedisCache {
             // Save the updated delegations back to the cache.
             self.set(&key, &all_delegations, None).await.map_err(AuctioneerError::RedisError)?;
         }
+
+        debug!(len, "saved delegations to cache");
 
         Ok(())
     }
