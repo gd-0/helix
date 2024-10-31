@@ -196,6 +196,9 @@ where
         Query(slot): Query<SlotQuery>,
     ) -> Result<impl IntoResponse, BuilderApiError> {
         let slot = slot.slot;
+
+        info!(slot, "builder requested constraints for slot");
+
         let head_slot = api.curr_slot_info.read().await.0;
 
         if slot < head_slot || slot > head_slot + 32 {
@@ -209,6 +212,7 @@ where
                     .map(|data| data.signed_constraints)
                     .collect::<Vec<SignedConstraints>>();
 
+                info!(slot, len = constraints.len(), "returning constraints to builder");
                 Ok(Json(constraints))
             }
             Ok(None) => {
