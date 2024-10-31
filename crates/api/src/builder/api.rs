@@ -1,9 +1,22 @@
 use std::{
-    collections::HashMap, io::Read, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}
+    collections::HashMap,
+    io::Read,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    body::{to_bytes, Body}, extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Query}, http::{Request, StatusCode}, response::{sse::{Event, KeepAlive}, IntoResponse, Response, Sse}, Extension, Json
+    body::{to_bytes, Body},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query,
+    },
+    http::{Request, StatusCode},
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
+    Extension, Json,
 };
 use ethereum_consensus::{
     configs::mainnet::{CAPELLA_FORK_EPOCH, SECONDS_PER_SLOT},
@@ -16,7 +29,9 @@ use futures::{Stream, StreamExt};
 use hyper::HeaderMap;
 use tokio::{
     sync::{
-        broadcast, mpsc::{self, error::SendError, Receiver, Sender}, RwLock
+        broadcast,
+        mpsc::{self, error::SendError, Receiver, Sender},
+        RwLock,
     },
     time::{self, Instant},
 };
@@ -26,13 +41,23 @@ use uuid::Uuid;
 
 use helix_common::{
     api::{
-        builder_api::{BuilderGetValidatorsResponse, BuilderGetValidatorsResponseEntry}, proposer_api::ValidatorRegistrationInfo
-    }, bid_submission::{
-        v2::header_submission::{
-            SignedHeaderSubmission, SignedHeaderSubmissionDeneb,
-        },
+        builder_api::{BuilderGetValidatorsResponse, BuilderGetValidatorsResponseEntry},
+        proposer_api::ValidatorRegistrationInfo,
+    },
+    bid_submission::{
+        v2::header_submission::{SignedHeaderSubmission, SignedHeaderSubmissionDeneb},
         BidSubmission, BidTrace, SignedBidSubmission,
-    }, chain_info::ChainInfo, proofs::{self, verify_multiproofs, ConstraintsWithProofData, InclusionProofs, SignedConstraints, SignedConstraintsWithProofData}, signing::RelaySigningContext, simulator::BlockSimError, versioned_payload::PayloadAndBlobs, BuilderInfo, GossipedHeaderTrace, GossipedPayloadTrace, HeaderSubmissionTrace, SignedBuilderBid, SubmissionTrace
+    },
+    chain_info::ChainInfo,
+    proofs::{
+        self, verify_multiproofs, ConstraintsWithProofData, InclusionProofs, SignedConstraints,
+        SignedConstraintsWithProofData,
+    },
+    signing::RelaySigningContext,
+    simulator::BlockSimError,
+    versioned_payload::PayloadAndBlobs,
+    BuilderInfo, GossipedHeaderTrace, GossipedPayloadTrace, HeaderSubmissionTrace,
+    SignedBuilderBid, SubmissionTrace,
 };
 use helix_database::{error::DatabaseError, DatabaseService};
 use helix_datastore::{error::AuctioneerError, types::SaveBidAndUpdateTopBidResponse, Auctioneer};
@@ -40,18 +65,24 @@ use helix_housekeeper::{ChainUpdate, PayloadAttributesUpdate, SlotUpdate};
 use helix_utils::{get_payload_attributes_key, has_reached_fork, try_decode_into};
 use serde::{de, Deserialize};
 
-use crate::{builder::{
-    error::{self, BuilderApiError}, traits::BlockSimulator, BlockSimRequest, DbInfo, OptimisticVersion,
-}, constraints::api::ConstraintsHandle, gossiper::{
-    traits::GossipClientTrait,
-    types::{BroadcastHeaderParams, BroadcastPayloadParams, GossipedMessage},
-}};
+use crate::{
+    builder::{
+        error::{self, BuilderApiError},
+        traits::BlockSimulator,
+        BlockSimRequest, DbInfo, OptimisticVersion,
+    },
+    constraints::api::ConstraintsHandle,
+    gossiper::{
+        traits::GossipClientTrait,
+        types::{BroadcastHeaderParams, BroadcastPayloadParams, GossipedMessage},
+    },
+};
 
 pub(crate) const MAX_PAYLOAD_LENGTH: usize = 1024 * 1024 * 10;
 
 #[derive(Deserialize)]
 pub struct SlotQuery {
-    slot: u64
+    slot: u64,
 }
 
 #[derive(Clone)]
@@ -97,7 +128,7 @@ where
         gossip_receiver: Receiver<GossipedMessage>,
     ) -> (Self, ConstraintsHandle) {
         let (db_sender, db_receiver) = mpsc::channel::<DbInfo>(10_000);
-        let (constraints_tx, _ ) = broadcast::channel(128);
+        let (constraints_tx, _) = broadcast::channel(128);
 
         // Spin up db processing task
         let db_clone = db.clone();
@@ -139,7 +170,7 @@ where
             }
         });
 
-        (api, ConstraintsHandle {constraints_tx} )
+        (api, ConstraintsHandle { constraints_tx })
     }
 
     /// Implements this API: <https://flashbots.github.io/relay-specs/#/Builder/getValidators>
@@ -158,7 +189,7 @@ where
     }
 
     /// This endpoint returns a list of signed constraints for a given `slot`.
-    /// 
+    ///
     /// Implements this API: <https://docs.boltprotocol.xyz/api/relay#constraints>
     pub async fn constraints(
         Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
@@ -166,18 +197,18 @@ where
     ) -> Result<impl IntoResponse, BuilderApiError> {
         let slot = slot.slot;
         let head_slot = api.curr_slot_info.read().await.0;
-        
+
         if slot < head_slot || slot > head_slot + 32 {
             return Err(BuilderApiError::IncorrectSlot(slot));
         }
-        
+
         match api.auctioneer.get_constraints(slot).await {
             Ok(Some(cache)) => {
                 let constraints = cache
                     .into_iter()
                     .map(|data| data.signed_constraints)
                     .collect::<Vec<SignedConstraints>>();
-        
+
                 Ok(Json(constraints))
             }
             Ok(None) => {
@@ -192,7 +223,7 @@ where
     }
 
     /// This endpoint returns a stream of signed constraints for a given `slot`.
-    /// 
+    ///
     /// Implements this API: <https://docs.boltprotocol.xyz/api/relay#constraints-stream>
     pub async fn constraints_stream(
         Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
@@ -220,19 +251,25 @@ where
         Sse::new(filtered).keep_alive(KeepAlive::default())
     }
 
-    /// This endpoint returns the active delegations for the validator scheduled to propose 
+    /// This endpoint returns the active delegations for the validator scheduled to propose
     /// at the provided `slot`. The delegations are returned as a list of BLS pubkeys.
-    /// 
+    ///
     /// Implements this API: <https://docs.boltprotocol.xyz/api/relay#delegations>
     pub async fn delegations(
         Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
         Query(slot): Query<SlotQuery>,
     ) -> Result<impl IntoResponse, BuilderApiError> {
         let slot = slot.slot;
+
+        info!(slot, "fetching delegations for slot");
+
         let Some(duty_bytes) = &*api.proposer_duties_response.read().await else {
+            warn!(slot, "delegations -- could not find slot duty");
             return Err(BuilderApiError::ProposerDutyNotFound);
         };
-        let Ok(proposer_duties) = serde_json::from_slice::<Vec<BuilderGetValidatorsResponse>>(duty_bytes) else {
+        let Ok(proposer_duties) =
+            serde_json::from_slice::<Vec<BuilderGetValidatorsResponse>>(duty_bytes)
+        else {
             return Err(BuilderApiError::DeserializeError);
         };
 
@@ -241,10 +278,15 @@ where
             .find(|duty| duty.slot == slot)
             .ok_or(BuilderApiError::ProposerDutyNotFound)?;
 
+        debug!(slot, duty = ?duty, "delegations -- found proposer duty");
+
         let pubkey = duty.entry.message.public_key.clone();
 
         match api.auctioneer.get_validator_delegations(pubkey).await {
-            Ok(delegations) => Ok(Json(delegations)),
+            Ok(delegations) => {
+                debug!(slot, delegations = ?delegations, "found delegations");
+                Ok(Json(delegations))
+            }
 
             Err(err) => {
                 warn!(error=%err, "Failed to get delegations");
@@ -403,7 +445,14 @@ where
         trace.pre_checks = get_nanos_timestamp()?;
 
         let (payload, was_simulated_optimistically) = api
-            .verify_submitted_block(payload, next_duty, &builder_info, &mut trace, &request_id, &payload_attributes)
+            .verify_submitted_block(
+                payload,
+                next_duty,
+                &builder_info,
+                &mut trace,
+                &request_id,
+                &payload_attributes,
+            )
             .await?;
 
         // If cancellations are enabled, then abort now if there is a later submission
@@ -460,7 +509,11 @@ where
 
         // Save submission to db.
         tokio::spawn(async move {
-            if let Err(err) = api.db.store_block_submission(payload, Arc::new(trace), optimistic_version as i16).await {
+            if let Err(err) = api
+                .db
+                .store_block_submission(payload, Arc::new(trace), optimistic_version as i16)
+                .await
+            {
                 error!(
                     error = %err,
                     "failed to store block submission",
@@ -499,7 +552,7 @@ where
         );
 
         // Decode the incoming request body into a payload with proofs
-        let (payload, is_cancellations_enabled) = 
+        let (payload, is_cancellations_enabled) =
             decode_payload(req, &mut trace, &request_id).await?;
         let block_hash = payload.message().block_hash.clone();
 
@@ -622,7 +675,14 @@ where
         trace.pre_checks = get_nanos_timestamp()?;
 
         let (payload, was_simulated_optimistically) = api
-            .verify_submitted_block(payload, next_duty, &builder_info, &mut trace, &request_id, &payload_attributes)
+            .verify_submitted_block(
+                payload,
+                next_duty,
+                &builder_info,
+                &mut trace,
+                &request_id,
+                &payload_attributes,
+            )
             .await?;
 
         // Fetch constraints
@@ -634,7 +694,7 @@ where
 
         // Verify inclusion proofs
         if let Err(err) = api.verify_inclusion_proof(&payload, &constraints).await {
-            return Err(err)
+            return Err(err);
         };
 
         // If cancellations are enabled, then abort now if there is a later submission
@@ -675,13 +735,16 @@ where
         }
 
         // Save inclusion proof to auctioneer.
-        if let Err(err) = api.save_inclusion_proof(
-            payload.slot(),
-            payload.proposer_public_key(),
-            payload.block_hash(),
-            payload.proofs().expect("proofs not found"),
-            &request_id
-        ).await {
+        if let Err(err) = api
+            .save_inclusion_proof(
+                payload.slot(),
+                payload.proposer_public_key(),
+                payload.block_hash(),
+                payload.proofs().expect("proofs not found"),
+                &request_id,
+            )
+            .await
+        {
             error!(request_id = %request_id, error = %err, "failed to save inclusion proofs");
         };
 
@@ -702,7 +765,11 @@ where
 
         // Save submission to db.
         tokio::spawn(async move {
-            if let Err(err) = api.db.store_block_submission(payload, Arc::new(trace), optimistic_version as i16).await {
+            if let Err(err) = api
+                .db
+                .store_block_submission(payload, Arc::new(trace), optimistic_version as i16)
+                .await
+            {
                 error!(
                     error = %err,
                     "failed to store block submission with proofs",
@@ -1074,7 +1141,14 @@ where
         trace.pre_checks = get_nanos_timestamp()?;
 
         let (payload, _) = match api
-            .verify_submitted_block(payload, next_duty, &builder_info, &mut trace, &request_id, &payload_attributes)
+            .verify_submitted_block(
+                payload,
+                next_duty,
+                &builder_info,
+                &mut trace,
+                &request_id,
+                &payload_attributes,
+            )
             .await
         {
             Ok(val) => val,
@@ -1115,7 +1189,11 @@ where
 
         // Save submission to db
         tokio::spawn(async move {
-            if let Err(err) = api.db.store_block_submission(payload, Arc::new(trace), OptimisticVersion::V2 as i16).await {
+            if let Err(err) = api
+                .db
+                .store_block_submission(payload, Arc::new(trace), OptimisticVersion::V2 as i16)
+                .await
+            {
                 error!(
                     error = %err,
                     "failed to store block submission",
@@ -1129,23 +1207,21 @@ where
     pub async fn get_top_bid(
         Extension(api): Extension<Arc<BuilderApi<A, DB, S, G>>>,
         headers: HeaderMap,
-        ws: WebSocketUpgrade
+        ws: WebSocketUpgrade,
     ) -> Result<impl IntoResponse, BuilderApiError> {
         let api_key = headers.get("x-api-key").and_then(|key| key.to_str().ok());
         match api_key {
-            Some(key) => {
-                match api.db.check_builder_api_key(key).await {
-                    Ok(true) => {}
-                    Ok(false) => return Err(BuilderApiError::InvalidApiKey),
-                    Err(err) => {
-                        error!(error = %err, "failed to check api key");
-                        return Err(BuilderApiError::InternalError)
-                    },
+            Some(key) => match api.db.check_builder_api_key(key).await {
+                Ok(true) => {}
+                Ok(false) => return Err(BuilderApiError::InvalidApiKey),
+                Err(err) => {
+                    error!(error = %err, "failed to check api key");
+                    return Err(BuilderApiError::InternalError);
                 }
             },
             None => return Err(BuilderApiError::InvalidApiKey),
         }
-        
+
         Ok(ws.on_upgrade(move |socket| push_top_bids(socket, api.auctioneer.clone())))
     }
 }
@@ -1258,7 +1334,10 @@ where
         // Save latency trace to db
         let db = self.db.clone();
         tokio::spawn(async move {
-            if let Err(err) = db.save_gossiped_header_trace(req.bid_trace.block_hash.clone(), Arc::new(trace)).await {
+            if let Err(err) = db
+                .save_gossiped_header_trace(req.bid_trace.block_hash.clone(), Arc::new(trace))
+                .await
+            {
                 error!(
                     error = %err,
                     "failed to store gossiped header trace",
@@ -1281,12 +1360,16 @@ where
         };
 
         // Save gossiped payload to auctioneer in case it was sent to diffent region than the header
-        if let Err(err) = self.auctioneer.save_pending_block_payload(
-            req.slot,
-            &req.proposer_pub_key,
-            &req.execution_payload.execution_payload.block_hash().clone(),
-            trace.receive / 1_000_000, // convert to ms
-        ).await {
+        if let Err(err) = self
+            .auctioneer
+            .save_pending_block_payload(
+                req.slot,
+                &req.proposer_pub_key,
+                &req.execution_payload.execution_payload.block_hash().clone(),
+                trace.receive / 1_000_000, // convert to ms
+            )
+            .await
+        {
             error!(request_id = %request_id, error = %err, "failed to save pending block header");
         }
 
@@ -1338,7 +1421,13 @@ where
         // Save gossiped payload trace to db
         let db = self.db.clone();
         tokio::spawn(async move {
-            if let Err(err) = db.save_gossiped_payload_trace(req.execution_payload.execution_payload.block_hash().clone(), Arc::new(trace)).await {
+            if let Err(err) = db
+                .save_gossiped_payload_trace(
+                    req.execution_payload.execution_payload.block_hash().clone(),
+                    Arc::new(trace),
+                )
+                .await
+            {
                 error!(
                     error = %err,
                     "failed to store gossiped payload trace",
@@ -1462,7 +1551,14 @@ where
         // Simulate the submission
         let payload = Arc::new(payload);
         let was_simulated_optimistically = self
-            .simulate_submission(payload.clone(), builder_info, trace, next_duty.entry, request_id, payload_attributes)
+            .simulate_submission(
+                payload.clone(),
+                builder_info,
+                trace,
+                next_duty.entry,
+                request_id,
+                payload_attributes,
+            )
             .await?;
 
         Ok((payload, was_simulated_optimistically))
@@ -1477,19 +1573,22 @@ where
         let mut tx_clone = payload.transactions().clone();
         let root = tx_clone.hash_tree_root().expect("failed to hash tree root");
         let root = root.to_vec().as_slice().try_into().expect("failed to convert to hash32");
-    
+
         let proofs = payload.proofs().expect("proofs not found");
-        let constraints: Vec<_> = constraints.iter().map(|c| ConstraintsWithProofData {
-            message: c.signed_constraints.message.clone(),
-            proof_data: c.proof_data.clone(),
-        }).collect();
-    
+        let constraints: Vec<_> = constraints
+            .iter()
+            .map(|c| ConstraintsWithProofData {
+                message: c.signed_constraints.message.clone(),
+                proof_data: c.proof_data.clone(),
+            })
+            .collect();
+
         match verify_multiproofs(&constraints, proofs, root) {
             Ok(_) => Ok(()),
             Err(e) => {
                 error!(error = %e, "failed to verify inclusion proofs");
                 Err(BuilderApiError::InclusionProofVerificationFailed)
-            },
+            }
         }
     }
 
@@ -1785,10 +1884,12 @@ where
     ) -> Result<PayloadAttributesUpdate, BuilderApiError> {
         let payload_attributes_key = get_payload_attributes_key(parent_hash, slot);
         let payload_attributes =
-            self.payload_attributes.read().await.get(&payload_attributes_key).cloned().ok_or_else(|| {
-                warn!(request_id = %request_id, "payload attributes not yet known");
-                BuilderApiError::PayloadAttributesNotYetKnown
-            })?;
+            self.payload_attributes.read().await.get(&payload_attributes_key).cloned().ok_or_else(
+                || {
+                    warn!(request_id = %request_id, "payload attributes not yet known");
+                    BuilderApiError::PayloadAttributesNotYetKnown
+                },
+            )?;
 
         if payload_attributes.slot != slot {
             warn!(request_id = %request_id, "payload attributes slot mismatch with payload attributes");
@@ -1997,7 +2098,8 @@ where
         );
 
         // Discard payload attributes if already known
-        let payload_attributes_key = get_payload_attributes_key(&payload_attributes.parent_hash, payload_attributes.slot);
+        let payload_attributes_key =
+            get_payload_attributes_key(&payload_attributes.parent_hash, payload_attributes.slot);
         let mut all_payload_attributes = self.payload_attributes.write().await;
         if all_payload_attributes.contains_key(&payload_attributes_key) {
             return;
@@ -2222,7 +2324,6 @@ pub async fn decode_header_submission(
         });
     }
 
-
     // Decode header
     let header: SignedHeaderSubmission = if is_ssz {
         match ssz::prelude::deserialize(&body_bytes) {
@@ -2236,7 +2337,7 @@ pub async fn decode_header_submission(
     } else {
         serde_json::from_slice(&body_bytes)?
     };
-    
+
     trace.decode = get_nanos_timestamp()?;
     info!(
         request_id = %request_id,
@@ -2264,7 +2365,8 @@ fn sanity_check_block_submission(
     payload_attributes: &PayloadAttributesUpdate,
     chain_info: &ChainInfo,
 ) -> Result<(), BuilderApiError> {
-    let expected_timestamp = chain_info.genesis_time_in_secs + (bid_trace.slot * chain_info.seconds_per_slot);
+    let expected_timestamp =
+        chain_info.genesis_time_in_secs + (bid_trace.slot * chain_info.seconds_per_slot);
     if payload.timestamp() != expected_timestamp {
         return Err(BuilderApiError::IncorrectTimestamp {
             got: payload.timestamp(),
@@ -2281,7 +2383,10 @@ fn sanity_check_block_submission(
     }
 
     if payload.slot() != next_duty.slot {
-        return Err(BuilderApiError::SlotMismatch { got: payload.slot(), expected: next_duty.slot });
+        return Err(BuilderApiError::SlotMismatch {
+            got: payload.slot(),
+            expected: next_duty.slot,
+        });
     }
 
     if next_duty.entry.registration.message.public_key != bid_trace.proposer_public_key {
@@ -2300,7 +2405,6 @@ fn sanity_check_block_submission(
     }
 
     if has_reached_fork(payload.slot(), CAPELLA_FORK_EPOCH) {
-
         if payload.is_full_payload() {
             let withdrawals_root = match payload.withdrawals_root() {
                 Some(w) => w,
@@ -2311,7 +2415,7 @@ fn sanity_check_block_submission(
                 Some(wr) => wr,
                 None => return Err(BuilderApiError::MissingWithdrawls),
             };
-    
+
             if withdrawals_root != expected_withdrawals_root {
                 return Err(BuilderApiError::WithdrawalsRootMismatch {
                     got: Hash32::try_from(withdrawals_root.as_ref()).unwrap(),
@@ -2445,8 +2549,8 @@ fn get_nanos_timestamp() -> Result<u64, BuilderApiError> {
 
 fn get_nanos_from(now: SystemTime) -> Result<u64, BuilderApiError> {
     now.duration_since(UNIX_EPOCH)
-    .map(|d| d.as_nanos() as u64)
-    .map_err(|_| BuilderApiError::InternalError)
+        .map(|d| d.as_nanos() as u64)
+        .map_err(|_| BuilderApiError::InternalError)
 }
 
 #[cfg(test)]
