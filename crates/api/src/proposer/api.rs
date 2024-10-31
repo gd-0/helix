@@ -253,7 +253,7 @@ where
 
             let pub_key = registration.message.public_key.clone();
 
-            debug!(
+            trace!(
                 request_id = %request_id,
                 pub_key = ?pub_key,
                 fee_recipient = %registration.message.fee_recipient,
