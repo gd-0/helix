@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use deadpool_redis::{Config, CreatePoolError, Pool, Runtime};
@@ -21,7 +21,7 @@ use helix_common::{
 use redis::{AsyncCommands, RedisResult, Script, Value};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::{error, debug};
+use tracing::{debug, error};
 
 use helix_common::{
     bid_submission::{BidTrace, SignedBidSubmission},
@@ -552,22 +552,18 @@ impl Auctioneer for RedisCache {
 
         for signed_delegation in signed_delegations {
             let key = get_delegations_key(&signed_delegation.message.validator_pubkey);
-    
+
             // Attempt to get the existing delegations from the cache.
-            let delegations: Option<Vec<SignedDelegation>> =
-                self.get(&key).await.map_err(AuctioneerError::RedisError)?;
-    
-            // Append the new delegation to the existing delegations or create a new Vec if none exist.
-            let all_delegations = match delegations {
-                Some(mut delegations) => {
-                    delegations.push(signed_delegation);
-                    delegations
-                }
-                None => Vec::from([signed_delegation]),
-            };
-    
+            let mut delegations: Vec<SignedDelegation> =
+                self.get(&key).await.map_err(AuctioneerError::RedisError)?.unwrap_or_default();
+
+            // Append the new delegation to the existing delegations, removing duplicates.
+            delegations.push(signed_delegation);
+            let new_delegations: Vec<SignedDelegation> =
+                delegations.into_iter().collect::<HashSet<_>>().into_iter().collect();
+
             // Save the updated delegations back to the cache.
-            self.set(&key, &all_delegations, None).await.map_err(AuctioneerError::RedisError)?;
+            self.set(&key, &new_delegations, None).await.map_err(AuctioneerError::RedisError)?;
         }
 
         debug!(len, "saved delegations to cache");
@@ -581,20 +577,22 @@ impl Auctioneer for RedisCache {
     ) -> Result<(), AuctioneerError> {
         for signed_revocation in &signed_revocations {
             let key = get_delegations_key(&signed_revocation.message.validator_pubkey);
-    
+
             // Attempt to get the existing delegations from the cache.
             let mut delegations: Vec<SignedDelegation> =
                 self.get(&key).await.map_err(AuctioneerError::RedisError)?.unwrap_or_default();
-    
+
             // Filter out the revoked delegation.
             let updated_delegations = delegations.retain(|delegation| {
                 signed_revocations.iter().all(|revocation| {
                     delegation.message.delegatee_pubkey != revocation.message.delegatee_pubkey
                 })
             });
-    
+
             // Save the updated delegations back to the cache.
-            self.set(&key, &updated_delegations, None).await.map_err(AuctioneerError::RedisError)?;
+            self.set(&key, &updated_delegations, None)
+                .await
+                .map_err(AuctioneerError::RedisError)?;
         }
 
         Ok(())
