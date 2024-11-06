@@ -21,7 +21,7 @@ use helix_common::{
 use redis::{AsyncCommands, RedisResult, Script, Value};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use helix_common::{
     bid_submission::{BidTrace, SignedBidSubmission},
@@ -537,10 +537,9 @@ impl Auctioneer for RedisCache {
     ) -> Result<Vec<SignedDelegation>, AuctioneerError> {
         let key = get_delegations_key(&pub_key);
 
-        let delegations: Option<Vec<SignedDelegation>> =
-            self.get(&key).await.map_err(AuctioneerError::RedisError)?;
-
-        Ok(delegations.unwrap_or_default())
+        let delegations =
+            self.get(&key).await.map_err(AuctioneerError::RedisError)?.unwrap_or_default();
+        Ok(delegations)
     }
 
     async fn save_validator_delegations(
@@ -548,8 +547,6 @@ impl Auctioneer for RedisCache {
         signed_delegations: Vec<SignedDelegation>,
     ) -> Result<(), AuctioneerError> {
         let len = signed_delegations.len();
-        debug!(len, "saving delegations to cache");
-
         for signed_delegation in signed_delegations {
             let key = get_delegations_key(&signed_delegation.message.validator_pubkey);
 
@@ -566,7 +563,7 @@ impl Auctioneer for RedisCache {
             self.set(&key, &new_delegations, None).await.map_err(AuctioneerError::RedisError)?;
         }
 
-        debug!(len, "saved delegations to cache");
+        trace!(len, "saved delegations to cache");
 
         Ok(())
     }
@@ -605,21 +602,14 @@ impl Auctioneer for RedisCache {
     ) -> Result<(), AuctioneerError> {
         let key = get_constraints_key(slot);
 
-        // Attempt to get the existing constraints from the cache.
-        let prev_constraints: Option<Vec<SignedConstraintsWithProofData>> =
-            self.get(&key).await.map_err(AuctioneerError::RedisError)?;
+        // Get the existing constraints from the cache or create new constraints.
+        let mut prev_constraints: Vec<SignedConstraintsWithProofData> =
+            self.get(&key).await.map_err(AuctioneerError::RedisError)?.unwrap_or_default();
 
-        // Append the new constraints to the existing constraints or create a new Vec if none exist.
-        let mut all_constraints = match prev_constraints {
-            Some(mut prev_constraints) => {
-                prev_constraints.push(constraints);
-                prev_constraints
-            }
-            None => Vec::from([constraints]),
-        };
+        prev_constraints.push(constraints);
 
-        // Save the updated constraints back to the cache.
-        self.set(&key, &all_constraints, Some(CONSTRAINTS_CACHE_EXPIRY_S))
+        // Save the constraints to the cache.
+        self.set(&key, &prev_constraints, Some(CONSTRAINTS_CACHE_EXPIRY_S))
             .await
             .map_err(AuctioneerError::RedisError)
     }

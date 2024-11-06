@@ -20,9 +20,12 @@ use helix_beacon_client::{
     multi_beacon_client::MultiBeaconClient, BlockBroadcaster, MultiBeaconClientTrait,
 };
 use helix_common::{
-    chain_info::ChainInfo, signing::RelaySigningContext, BroadcasterConfig, BuilderInfo, NetworkConfig, RelayConfig
+    chain_info::ChainInfo, signing::RelaySigningContext, BroadcasterConfig, BuilderInfo,
+    NetworkConfig, RelayConfig,
 };
-use helix_database::{postgres::postgres_db_service::PostgresDatabaseService, BuilderInfoDocument, DatabaseService};
+use helix_database::{
+    postgres::postgres_db_service::PostgresDatabaseService, BuilderInfoDocument, DatabaseService,
+};
 use helix_datastore::redis::redis_cache::RedisCache;
 use helix_housekeeper::{ChainEventUpdater, Housekeeper};
 
@@ -45,7 +48,8 @@ impl ApiService {
 
         let db = Arc::new(postgres_db);
 
-        let mut builder_infos = db.get_all_builder_infos().await.expect("failed to load builder infos");
+        let mut builder_infos =
+            db.get_all_builder_infos().await.expect("failed to load builder infos");
 
         builder_infos.push(BuilderInfoDocument {
             pub_key: PublicKey::try_from(
@@ -200,7 +204,7 @@ impl ApiService {
             auctioneer.clone(),
             db.clone(),
             chain_info.clone(),
-            constraints_handle
+            constraints_handle,
         ));
 
         let bids_cache: Arc<BidsCache> = Arc::new(

@@ -230,7 +230,7 @@ where
 
         let (head_slot, _) = *proposer_api.curr_slot_info.read().await;
         let num_registrations = registrations.len();
-        debug!(
+        trace!(
             request_id = %request_id,
             event = "register_validators",
             head_slot = head_slot,
@@ -504,20 +504,9 @@ where
 
                 // Get inclusion proofs
                 let proofs = proposer_api
-                    .get_inclusion_proof(
-                        slot,
-                        &bid_request.public_key,
-                        bid.block_hash(),
-                        &request_id,
-                    )
-                    .await;
-
-                info!(
-                    request_id = %request_id,
-                    value = ?bid.value(),
-                    block_hash = ?bid.block_hash(),
-                    "delivering bid with proofs",
-                );
+                    .auctioneer
+                    .get_inclusion_proof(slot, &bid_request.public_key, bid.block_hash())
+                    .await?;
 
                 // Save trace to DB
                 proposer_api
@@ -534,6 +523,37 @@ where
                 // Attach the proofs to the bid before sending it back
                 if let Some(proofs) = proofs {
                     bid.set_inclusion_proofs(proofs);
+
+                    info!(
+                        request_id = %request_id,
+                        slot,
+                        value = ?bid.value(),
+                        block_hash = ?bid.block_hash(),
+                        "delivering bid with proofs",
+                    );
+                } else {
+                    // Check whether we had constraints saved in the auctioneer.
+                    // If so, this is an internal error and we cannot return a valid bid.
+                    let constraints =
+                        proposer_api.auctioneer.get_constraints(slot).await?.unwrap_or_default();
+
+                    if !constraints.is_empty() {
+                        error!(
+                            request_id = %request_id,
+                            slot,
+                            block_hash = ?bid.block_hash(),
+                            "no inclusion proofs found from auctioneer for bid, but constraints were saved",
+                        );
+                        return Err(ProposerApiError::InternalServerError);
+                    }
+
+                    info!(
+                        request_id = %request_id,
+                        slot,
+                        value = ?bid.value(),
+                        block_hash = ?bid.block_hash(),
+                        "delivering bid with empty proofs, no constraints found",
+                    );
                 }
 
                 // Return header with proofs
@@ -1156,29 +1176,6 @@ where
                     });
                 }
                 _ => {}
-            }
-        }
-    }
-
-    /// This function fetches the inclusion proof for a given slot, public key, and block hash.
-    async fn get_inclusion_proof(
-        &self,
-        slot: u64,
-        public_key: &BlsPublicKey,
-        bid_block_hash: &ByteVector<32>,
-        request_id: &Uuid,
-    ) -> Option<InclusionProofs> {
-        let inclusion_proof =
-            self.auctioneer.get_inclusion_proof(slot, public_key, bid_block_hash).await;
-        match inclusion_proof {
-            Ok(Some(proof)) => Some(proof),
-            Ok(None) => {
-                warn!(request_id = %request_id, "inclusion proof not found");
-                None
-            }
-            Err(err) => {
-                error!(request_id = %request_id, error = %err, "error fetching inclusion proof");
-                None
             }
         }
     }

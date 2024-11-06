@@ -19,7 +19,7 @@ use axum::{
     Extension, Json,
 };
 use ethereum_consensus::{
-    configs::mainnet::{CAPELLA_FORK_EPOCH, SECONDS_PER_SLOT},
+    configs::mainnet::CAPELLA_FORK_EPOCH,
     phase0::mainnet::SLOTS_PER_EPOCH,
     primitives::{BlsPublicKey, Hash32},
     ssz::{self, prelude::*},
@@ -27,6 +27,7 @@ use ethereum_consensus::{
 use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt};
 use hyper::HeaderMap;
+use reth_primitives::B256;
 use tokio::{
     sync::{
         broadcast,
@@ -45,31 +46,25 @@ use helix_common::{
         proposer_api::ValidatorRegistrationInfo,
     },
     bid_submission::{
-        v2::header_submission::{SignedHeaderSubmission, SignedHeaderSubmissionDeneb},
-        BidSubmission, BidTrace, SignedBidSubmission,
+        v2::header_submission::SignedHeaderSubmission, BidSubmission, BidTrace, SignedBidSubmission,
     },
     chain_info::ChainInfo,
-    proofs::{
-        self, verify_multiproofs, ConstraintsWithProofData, InclusionProofs, SignedConstraints,
-        SignedConstraintsWithProofData,
-    },
+    proofs::{verify_multiproofs, InclusionProofs, SignedConstraints},
     signing::RelaySigningContext,
     simulator::BlockSimError,
     versioned_payload::PayloadAndBlobs,
     BuilderInfo, GossipedHeaderTrace, GossipedPayloadTrace, HeaderSubmissionTrace,
     SignedBuilderBid, SubmissionTrace,
 };
-use helix_database::{error::DatabaseError, DatabaseService};
-use helix_datastore::{error::AuctioneerError, types::SaveBidAndUpdateTopBidResponse, Auctioneer};
+use helix_database::DatabaseService;
+use helix_datastore::{types::SaveBidAndUpdateTopBidResponse, Auctioneer};
 use helix_housekeeper::{ChainUpdate, PayloadAttributesUpdate, SlotUpdate};
-use helix_utils::{get_payload_attributes_key, has_reached_fork, try_decode_into};
-use serde::{de, Deserialize};
+use helix_utils::{get_payload_attributes_key, has_reached_fork};
+use serde::Deserialize;
 
 use crate::{
     builder::{
-        error::{self, BuilderApiError},
-        traits::BlockSimulator,
-        BlockSimRequest, DbInfo, OptimisticVersion,
+        error::BuilderApiError, traits::BlockSimulator, BlockSimRequest, DbInfo, OptimisticVersion,
     },
     constraints::api::ConstraintsHandle,
     gossiper::{
@@ -265,8 +260,6 @@ where
     ) -> Result<impl IntoResponse, BuilderApiError> {
         let slot = slot.slot;
 
-        info!(slot, "fetching delegations for slot");
-
         let Some(duty_bytes) = &*api.proposer_duties_response.read().await else {
             warn!(slot, "delegations -- could not find slot duty");
             return Err(BuilderApiError::ProposerDutyNotFound);
@@ -282,21 +275,10 @@ where
             .find(|duty| duty.slot == slot)
             .ok_or(BuilderApiError::ProposerDutyNotFound)?;
 
-        debug!(slot, duty = ?duty, "delegations -- found proposer duty");
-
         let pubkey = duty.entry.message.public_key.clone();
+        let delegations = Json(api.auctioneer.get_validator_delegations(pubkey).await?);
 
-        match api.auctioneer.get_validator_delegations(pubkey).await {
-            Ok(delegations) => {
-                debug!(slot, delegations = ?delegations, "found delegations");
-                Ok(Json(delegations))
-            }
-
-            Err(err) => {
-                warn!(error=%err, "Failed to get delegations");
-                Err(BuilderApiError::AuctioneerError(err))
-            }
-        }
+        Ok(delegations)
     }
 
     /// Handles the submission of a new block by performing various checks and verifications
@@ -572,7 +554,7 @@ where
             builder_pub_key = ?payload.builder_public_key(),
             block_value = %payload.value(),
             block_hash = ?block_hash,
-            "payload decoded with proofs",
+            "submit_block_with_proofs -- payload decoded",
         );
 
         // Verify the payload is for the current slot
@@ -689,16 +671,42 @@ where
             )
             .await?;
 
-        // Fetch constraints
-        let constraints = api.auctioneer.get_constraints(payload.slot()).await?;
-        let Some(constraints) = constraints else {
-            warn!(request_id = %request_id, "no constraints found for slot");
-            return Err(BuilderApiError::NoConstraintsFound);
-        };
+        // Fetch constraints, and if available verify inclusion proofs and save them to cache
+        if let Some(constraints) = api.auctioneer.get_constraints(payload.slot()).await? {
+            let transactions_root: B256 = payload
+                .transactions()
+                .clone()
+                .hash_tree_root()?
+                .to_vec()
+                .as_slice()
+                .try_into()
+                .map_err(|e| {
+                    error!(error = %e, "failed to convert root to hash32");
+                    BuilderApiError::InternalError
+                })?;
+            let proofs = payload.proofs().ok_or(BuilderApiError::InclusionProofsNotFound)?;
+            let constraints_proofs: Vec<_> = constraints.iter().map(|c| &c.proof_data).collect();
 
-        // Verify inclusion proofs
-        if let Err(err) = api.verify_inclusion_proof(&payload, &constraints).await {
-            return Err(err);
+            verify_multiproofs(constraints_proofs.as_slice(), proofs, transactions_root).map_err(
+                |e| {
+                    error!(error = %e, "failed to verify inclusion proofs");
+                    BuilderApiError::InclusionProofVerificationFailed(e)
+                },
+            )?;
+
+            // Save inclusion proof to auctioneer.
+            api.save_inclusion_proof(
+                payload.slot(),
+                payload.proposer_public_key(),
+                payload.block_hash(),
+                proofs,
+                &request_id,
+            )
+            .await?;
+
+            info!(request_id = %request_id, head_slot, "inclusion proofs verified and saved to auctioneer");
+        } else {
+            info!(request_id = %request_id, "no constraints found for slot, proof verification is not needed");
         };
 
         // If cancellations are enabled, then abort now if there is a later submission
@@ -737,20 +745,6 @@ where
             }
             None => { /* Bid wasn't saved so no need to gossip as it will never be served */ }
         }
-
-        // Save inclusion proof to auctioneer.
-        if let Err(err) = api
-            .save_inclusion_proof(
-                payload.slot(),
-                payload.proposer_public_key(),
-                payload.block_hash(),
-                payload.proofs().expect("proofs not found"),
-                &request_id,
-            )
-            .await
-        {
-            error!(request_id = %request_id, error = %err, "failed to save inclusion proofs");
-        };
 
         // Log some final info
         trace.request_finish = get_nanos_timestamp()?;
@@ -1566,34 +1560,6 @@ where
             .await?;
 
         Ok((payload, was_simulated_optimistically))
-    }
-
-    /// Verifies the inclusion proofs of the constraints.
-    async fn verify_inclusion_proof(
-        &self,
-        payload: &SignedBidSubmission,
-        constraints: &[SignedConstraintsWithProofData],
-    ) -> Result<(), BuilderApiError> {
-        let mut tx_clone = payload.transactions().clone();
-        let root = tx_clone.hash_tree_root().expect("failed to hash tree root");
-        let root = root.to_vec().as_slice().try_into().expect("failed to convert to hash32");
-
-        let proofs = payload.proofs().expect("proofs not found");
-        let constraints: Vec<_> = constraints
-            .iter()
-            .map(|c| ConstraintsWithProofData {
-                message: c.signed_constraints.message.clone(),
-                proof_data: c.proof_data.clone(),
-            })
-            .collect();
-
-        match verify_multiproofs(&constraints, proofs, root) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!(error = %e, "failed to verify inclusion proofs");
-                Err(BuilderApiError::InclusionProofVerificationFailed)
-            }
-        }
     }
 
     /// Check for block hashes that have already been processed.
