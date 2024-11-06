@@ -706,7 +706,7 @@ where
 
             info!(request_id = %request_id, head_slot, "inclusion proofs verified and saved to auctioneer");
         } else {
-            warn!(request_id = %request_id, "no constraints found for slot, proof verification is not needed");
+            info!(request_id = %request_id, "no constraints found for slot, proof verification is not needed");
         };
 
         // If cancellations are enabled, then abort now if there is a later submission
