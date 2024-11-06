@@ -230,7 +230,7 @@ where
 
         let (head_slot, _) = *proposer_api.curr_slot_info.read().await;
         let num_registrations = registrations.len();
-        debug!(
+        trace!(
             request_id = %request_id,
             event = "register_validators",
             head_slot = head_slot,
@@ -512,13 +512,6 @@ where
                     )
                     .await;
 
-                info!(
-                    request_id = %request_id,
-                    value = ?bid.value(),
-                    block_hash = ?bid.block_hash(),
-                    "delivering bid with proofs",
-                );
-
                 // Save trace to DB
                 proposer_api
                     .save_get_header_call(
@@ -534,6 +527,37 @@ where
                 // Attach the proofs to the bid before sending it back
                 if let Some(proofs) = proofs {
                     bid.set_inclusion_proofs(proofs);
+
+                    info!(
+                        request_id = %request_id,
+                        slot,
+                        value = ?bid.value(),
+                        block_hash = ?bid.block_hash(),
+                        "delivering bid with proofs",
+                    );
+                } else {
+                    // Check whether we had constraints saved in the auctioneer.
+                    // If so, this is an internal error and we cannot return a valid bid.
+                    let constraints =
+                        proposer_api.auctioneer.get_constraints(slot).await?.unwrap_or_default();
+
+                    if !constraints.is_empty() {
+                        error!(
+                            request_id = %request_id,
+                            slot,
+                            block_hash = ?bid.block_hash(),
+                            "no inclusion proofs found from auctioneer for bid, but constraints were saved",
+                        );
+                        return Err(ProposerApiError::InternalServerError);
+                    }
+
+                    info!(
+                        request_id = %request_id,
+                        slot,
+                        value = ?bid.value(),
+                        block_hash = ?bid.block_hash(),
+                        "delivering bid with empty proofs, no constraints found",
+                    );
                 }
 
                 // Return header with proofs
