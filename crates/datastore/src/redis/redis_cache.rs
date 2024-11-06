@@ -605,21 +605,14 @@ impl Auctioneer for RedisCache {
     ) -> Result<(), AuctioneerError> {
         let key = get_constraints_key(slot);
 
-        // Attempt to get the existing constraints from the cache.
-        let prev_constraints: Option<Vec<SignedConstraintsWithProofData>> =
-            self.get(&key).await.map_err(AuctioneerError::RedisError)?;
+        // Get the existing constraints from the cache or create new constraints.
+        let mut prev_constraints: Vec<SignedConstraintsWithProofData> =
+            self.get(&key).await.map_err(AuctioneerError::RedisError)?.unwrap_or_default();
 
-        // Append the new constraints to the existing constraints or create a new Vec if none exist.
-        let mut all_constraints = match prev_constraints {
-            Some(mut prev_constraints) => {
-                prev_constraints.push(constraints);
-                prev_constraints
-            }
-            None => Vec::from([constraints]),
-        };
+        prev_constraints.push(constraints);
 
-        // Save the updated constraints back to the cache.
-        self.set(&key, &all_constraints, Some(CONSTRAINTS_CACHE_EXPIRY_S))
+        // Save the constraints to the cache.
+        self.set(&key, &prev_constraints, Some(CONSTRAINTS_CACHE_EXPIRY_S))
             .await
             .map_err(AuctioneerError::RedisError)
     }
