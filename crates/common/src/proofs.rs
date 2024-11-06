@@ -5,7 +5,7 @@ use ethereum_consensus::{
     primitives::{BlsPublicKey, BlsSignature},
     ssz::prelude::*,
 };
-use reth_primitives::{keccak256, PooledTransactionsElement, TxHash, B256};
+use reth_primitives::{PooledTransactionsElement, TxHash, B256};
 use sha2::{Digest, Sha256};
 use tree_hash::Hash256;
 
@@ -62,7 +62,7 @@ impl SignableBLS for ConstraintsMessage {
     fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(&self.pubkey.to_vec());
-        hasher.update(&self.slot.to_le_bytes());
+        hasher.update(self.slot.to_le_bytes());
         hasher.update((self.top as u8).to_le_bytes());
         for tx in self.transactions.iter() {
             // Convert the opaque bytes to a EIP-2718 envelope and obtain the tx hash.
@@ -76,18 +76,13 @@ impl SignableBLS for ConstraintsMessage {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct ConstraintsWithProofData {
-    pub message: ConstraintsMessage,
-    /// List of transaction hashes and corresponding hash tree roots. Same order
-    /// as the transactions in the `message`.
-    pub proof_data: Vec<(TxHash, HashTreeRoot)>,
-}
+/// List of transaction hashes and the corresponding hash tree roots of the raw transactions.
+pub type ConstraintsProofData = Vec<(TxHash, HashTreeRoot)>;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct SignedConstraintsWithProofData {
     pub signed_constraints: SignedConstraints,
-    pub proof_data: Vec<(TxHash, HashTreeRoot)>,
+    pub proof_data: ConstraintsProofData,
 }
 
 impl TryFrom<SignedConstraints> for SignedConstraintsWithProofData {
@@ -120,13 +115,16 @@ impl TryFrom<SignedConstraints> for SignedConstraintsWithProofData {
 }
 
 /// Returns the length of the leaves that need to be proven (i.e.  transactions).
-fn total_leaves(constraints: &[ConstraintsWithProofData]) -> usize {
-    constraints.iter().map(|c| c.proof_data.len()).sum()
+fn total_leaves(constraints: &[&ConstraintsProofData]) -> usize {
+    constraints.iter().map(|c| c.len()).sum()
 }
 
 /// Verifies the provided multiproofs against the constraints & transactions root.
+///
+/// NOTE: the constraints hashes and hash tree roots must be in the same order of the transaction
+/// hashes in the inclusion proofs.
 pub fn verify_multiproofs(
-    constraints: &[ConstraintsWithProofData],
+    constraints_proofs_data: &[&ConstraintsProofData],
     proofs: &InclusionProofs,
     root: B256,
 ) -> Result<(), ProofError> {
@@ -135,7 +133,7 @@ pub fn verify_multiproofs(
         return Err(ProofError::LengthMismatch);
     }
 
-    let total_leaves = total_leaves(constraints);
+    let total_leaves = total_leaves(constraints_proofs_data);
 
     // Check if the total leaves matches the proofs provided
     if total_leaves != proofs.total_leaves() {
@@ -149,8 +147,8 @@ pub fn verify_multiproofs(
     // We need the leaves in order to verify the multiproof.
     for hash in proofs.transaction_hashes.iter() {
         let mut found = false;
-        for constraint in constraints {
-            for (saved_hash, leaf) in &constraint.proof_data {
+        for constraints_proof in constraints_proofs_data {
+            for (saved_hash, leaf) in *constraints_proof {
                 if saved_hash.as_slice() == hash.as_slice() {
                     found = true;
                     leaves.push(B256::from(leaf.0));
