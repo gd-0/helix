@@ -250,7 +250,6 @@ where
 
         // Store the delegation in the database
         tokio::spawn(async move {
-            debug!(request_id = %request_id, len = signed_delegations.len(), "saving delegations to cache");
             if let Err(err) = api.auctioneer.save_validator_delegations(signed_delegations).await {
                 error!(error = %err, "Failed to save delegations");
             }

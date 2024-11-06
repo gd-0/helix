@@ -260,8 +260,6 @@ where
     ) -> Result<impl IntoResponse, BuilderApiError> {
         let slot = slot.slot;
 
-        info!(slot, "fetching delegations for slot");
-
         let Some(duty_bytes) = &*api.proposer_duties_response.read().await else {
             warn!(slot, "delegations -- could not find slot duty");
             return Err(BuilderApiError::ProposerDutyNotFound);
@@ -277,21 +275,10 @@ where
             .find(|duty| duty.slot == slot)
             .ok_or(BuilderApiError::ProposerDutyNotFound)?;
 
-        debug!(slot, duty = ?duty, "delegations -- found proposer duty");
-
         let pubkey = duty.entry.message.public_key.clone();
+        let delegations = Json(api.auctioneer.get_validator_delegations(pubkey).await?);
 
-        match api.auctioneer.get_validator_delegations(pubkey).await {
-            Ok(delegations) => {
-                debug!(slot, delegations = ?delegations, "found delegations");
-                Ok(Json(delegations))
-            }
-
-            Err(err) => {
-                warn!(error=%err, "Failed to get delegations");
-                Err(BuilderApiError::AuctioneerError(err))
-            }
-        }
+        Ok(delegations)
     }
 
     /// Handles the submission of a new block by performing various checks and verifications

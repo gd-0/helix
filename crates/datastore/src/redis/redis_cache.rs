@@ -537,10 +537,9 @@ impl Auctioneer for RedisCache {
     ) -> Result<Vec<SignedDelegation>, AuctioneerError> {
         let key = get_delegations_key(&pub_key);
 
-        let delegations: Option<Vec<SignedDelegation>> =
-            self.get(&key).await.map_err(AuctioneerError::RedisError)?;
-
-        Ok(delegations.unwrap_or_default())
+        let delegations =
+            self.get(&key).await.map_err(AuctioneerError::RedisError)?.unwrap_or_default();
+        Ok(delegations)
     }
 
     async fn save_validator_delegations(
