@@ -6,7 +6,7 @@ use ethereum_consensus::{
     primitives::{BlsPublicKey, Bytes32, Hash32},
     ssz::{self, prelude::*},
 };
-use helix_common::simulator::BlockSimError;
+use helix_common::{proofs::ProofError, simulator::BlockSimError};
 use helix_database::error::DatabaseError;
 use helix_datastore::error::AuctioneerError;
 
@@ -143,8 +143,14 @@ pub enum BuilderApiError {
     #[error("no constraints found")]
     NoConstraintsFound,
 
-    #[error("inclusion proof verification failed")]
-    InclusionProofVerificationFailed,
+    #[error("inclusion proof verification failed: {0}")]
+    InclusionProofVerificationFailed(#[from] ProofError),
+
+    #[error("inclusion proofs not found")]
+    InclusionProofsNotFound,
+
+    #[error("failed to compute hash tree root for transaction: {0}")]
+    HashTreeRootError(#[from] MerkleizationError),
 
     #[error("failed to get constraints for slot {0}")]
     ConstraintsError(u64),
@@ -166,7 +172,7 @@ impl IntoResponse for BuilderApiError {
                 (StatusCode::BAD_REQUEST, format!("SSZ deserialize error: {err}")).into_response()
             },
             BuilderApiError::SszSerializeError => {
-                (StatusCode::BAD_REQUEST, format!("SSZ serialize error")).into_response()
+                (StatusCode::BAD_REQUEST, "SSZ serialize error".to_string()).into_response()
             },
             BuilderApiError::DeserializeError => {
                 (StatusCode::BAD_REQUEST, "Failed to deserialize").into_response()
@@ -297,8 +303,14 @@ impl IntoResponse for BuilderApiError {
             BuilderApiError::NoConstraintsFound => {
                 (StatusCode::BAD_REQUEST, "no constraints found").into_response()
             }
-            BuilderApiError::InclusionProofVerificationFailed => {
-                (StatusCode::BAD_REQUEST, "inclusion proof verification failed").into_response()
+            BuilderApiError::InclusionProofVerificationFailed(err) => {
+                (StatusCode::BAD_REQUEST, format!("inclusion proof verifcation failed: {err}")).into_response()
+            }
+            BuilderApiError::InclusionProofsNotFound => {
+                (StatusCode::BAD_REQUEST, "inclusion proofs not found".to_string()).into_response()
+            }
+            BuilderApiError::HashTreeRootError(err) => {
+                (StatusCode::BAD_REQUEST, format!("failed to compute hash tree root for transaction: {err}")).into_response()
             }
             BuilderApiError::ConstraintsError(slot) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to get constraints for slot {slot}")).into_response()

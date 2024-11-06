@@ -1575,10 +1575,13 @@ where
         constraints: &[SignedConstraintsWithProofData],
     ) -> Result<(), BuilderApiError> {
         let mut tx_clone = payload.transactions().clone();
-        let root = tx_clone.hash_tree_root().expect("failed to hash tree root");
-        let root = root.to_vec().as_slice().try_into().expect("failed to convert to hash32");
+        let root = tx_clone.hash_tree_root()?;
+        let root = root.to_vec().as_slice().try_into().map_err(|e| {
+            error!(error = %e, "failed to convert root to hash32");
+            BuilderApiError::InternalError
+        })?;
 
-        let proofs = payload.proofs().expect("proofs not found");
+        let proofs = payload.proofs().ok_or(BuilderApiError::InclusionProofsNotFound)?;
         let constraints: Vec<_> = constraints
             .iter()
             .map(|c| ConstraintsWithProofData {
@@ -1587,13 +1590,10 @@ where
             })
             .collect();
 
-        match verify_multiproofs(&constraints, proofs, root) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!(error = %e, "failed to verify inclusion proofs");
-                Err(BuilderApiError::InclusionProofVerificationFailed)
-            }
-        }
+        verify_multiproofs(&constraints, proofs, root).map_err(|e| {
+            error!(error = %e, "failed to verify inclusion proofs");
+            BuilderApiError::InclusionProofVerificationFailed(e)
+        })
     }
 
     /// Check for block hashes that have already been processed.
