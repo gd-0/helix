@@ -504,13 +504,9 @@ where
 
                 // Get inclusion proofs
                 let proofs = proposer_api
-                    .get_inclusion_proof(
-                        slot,
-                        &bid_request.public_key,
-                        bid.block_hash(),
-                        &request_id,
-                    )
-                    .await;
+                    .auctioneer
+                    .get_inclusion_proof(slot, &bid_request.public_key, bid.block_hash())
+                    .await?;
 
                 // Save trace to DB
                 proposer_api
@@ -1180,29 +1176,6 @@ where
                     });
                 }
                 _ => {}
-            }
-        }
-    }
-
-    /// This function fetches the inclusion proof for a given slot, public key, and block hash.
-    async fn get_inclusion_proof(
-        &self,
-        slot: u64,
-        public_key: &BlsPublicKey,
-        bid_block_hash: &ByteVector<32>,
-        request_id: &Uuid,
-    ) -> Option<InclusionProofs> {
-        let inclusion_proof =
-            self.auctioneer.get_inclusion_proof(slot, public_key, bid_block_hash).await;
-        match inclusion_proof {
-            Ok(Some(proof)) => Some(proof),
-            Ok(None) => {
-                warn!(request_id = %request_id, "inclusion proof not found");
-                None
-            }
-            Err(err) => {
-                error!(request_id = %request_id, error = %err, "error fetching inclusion proof");
-                None
             }
         }
     }
