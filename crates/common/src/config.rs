@@ -142,6 +142,9 @@ pub struct ConstraintsApiConfig {
     /// Only verify and save inclusion proofs if the block value is less than this threshold.
     /// We do this to ensure that high value blocks are not rejected.
     pub max_block_value_to_verify_wei: Option<U256>,
+    /// If true, submissions for slots with constraints but, without inclusion proofs
+    /// will be allowed. Constraint validity will be verified in the relay.
+    pub allow_relay_side_constraint_validation: bool,
 }
 
 impl Default for ConstraintsApiConfig {
@@ -149,6 +152,7 @@ impl Default for ConstraintsApiConfig {
         ConstraintsApiConfig {
             check_constraints_signature: true,
             max_block_value_to_verify_wei: None,
+            allow_relay_side_constraint_validation: false,
         }
     }
 }
